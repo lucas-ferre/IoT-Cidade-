@@ -1,0 +1,13 @@
+smartcity.AggregatorLoad.aggregator_id max_size:32
+smartcity.AggregatorLoad.ip_address max_size:40
+
+smartcity.DiscoveryResponse.message_id max_size:80
+smartcity.DiscoveryResponse.device_id max_size:32
+smartcity.DiscoveryResponse.ip_address max_size:40
+
+smartcity.DataPayload.message_id max_size:80
+smartcity.DataPayload.device_id max_size:32
+smartcity.DataPayload.metrics max_count:6
+
+smartcity.Metric.name max_size:16
+smartcity.Metric.unit max_size:16

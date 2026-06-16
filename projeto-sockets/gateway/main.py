@@ -14,7 +14,21 @@ from typing import Tuple
 
 # Biblioteca assíncrona para I/O não-bloqueante no SQLite
 import aiosqlite
+import redis.asyncio as redis
 from google.protobuf.message import DecodeError
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+_raw_key = os.getenv("AES_SECRET_KEY", "SmartCityKey1234").encode("utf-8")
+AES_KEY = _raw_key.ljust(16, b'0')[:16]  # 16 bytes (AES-128)
+
+def decrypt_payload(raw_payload: bytes) -> bytes:
+    """Descriptografa o payload AES-128-GCM vindo do Redis."""
+    if len(raw_payload) < 28: # 12 nonce + pelo menos 1 byte + 16 tag
+        raise ValueError("Payload criptografado muito curto")
+    nonce = raw_payload[:12]
+    ciphertext = raw_payload[12:]
+    aesgcm = AESGCM(AES_KEY)
+    return aesgcm.decrypt(nonce, ciphertext, None)
 
 # ====================================================================
 # [M5] LOGGING CONFIGURÁVEL VIA ENV VAR
@@ -93,9 +107,44 @@ import messages_pb2  # pyright: ignore[reportMissingImports]
 # CONFIGURAÇÕES DE REDE
 # ====================================================================
 
-UDP_TELEMETRY_PORT = 5000   # Porta dedicada exclusivamente à ingestão de dados
-UDP_DISCOVERY_PORT = 5002   # Porta dedicada exclusivamente aos handshakes de topologia
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+
 TCP_PORT           = 5001
+AUTH_PORT          = 5007
+
+GATEWAY_LICENSE_KEY = os.getenv("GATEWAY_LICENSE_KEY", "SMARTCITY-V1-FULL-LICENSE")
+MAX_AVAILABLE_PORTS = max(1, int(os.getenv("MAX_AVAILABLE_PORTS", "100")))
+MIN_DYNAMIC_PORT = 6000
+
+class InvalidLicenseKeyException(Exception): pass
+class InvalidHexServiceCodeException(Exception): pass
+class NoPortsAvailableException(Exception): pass
+
+import random
+_AVAILABLE_PORTS = set(range(MIN_DYNAMIC_PORT, MIN_DYNAMIC_PORT + MAX_AVAILABLE_PORTS))
+_LAST_ASSIGNED_PORT = 0
+_HEX_SERVICE_CODES = {
+    messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT: "0A",
+    messages_pb2.DEVICE_TYPE_LAMP_POST: "0B",
+    messages_pb2.DEVICE_TYPE_WEATHER_STATION: "0C",
+    messages_pb2.DEVICE_TYPE_CAMERA: "0D",
+}
+
+def allocate_dynamic_port():
+    global _LAST_ASSIGNED_PORT
+    if not _AVAILABLE_PORTS:
+        raise NoPortsAvailableException("Nao ha portas disponiveis no Gateway")
+    candidates = list(_AVAILABLE_PORTS - {_LAST_ASSIGNED_PORT})
+    if not candidates:
+        if _LAST_ASSIGNED_PORT in _AVAILABLE_PORTS:
+            candidates = [_LAST_ASSIGNED_PORT]
+        else:
+            raise NoPortsAvailableException("Nao ha portas disponiveis no Gateway")
+    port = random.choice(candidates)
+    _AVAILABLE_PORTS.remove(port)
+    _LAST_ASSIGNED_PORT = port
+    return port
 
 # Timeout para leitura de cabeçalho e payload TCP do cliente (configurável)
 TCP_CLIENT_READ_TIMEOUT = max(5.0, float(os.getenv("TCP_CLIENT_READ_TIMEOUT", "10")))
@@ -291,9 +340,27 @@ def init_db():
             ip_address   TEXT,
             control_port INTEGER,
             is_controllable INTEGER,
-            last_seen    INTEGER
+            last_seen    INTEGER,
+            aggregator_id TEXT,
+            coord_x      INTEGER,
+            coord_y      INTEGER
         )
     """)
+    # Migration if table already exists
+    try:
+        cursor.execute("ALTER TABLE devices ADD COLUMN aggregator_id TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    try:
+        cursor.execute("ALTER TABLE devices ADD COLUMN coord_x INTEGER")
+        cursor.execute("ALTER TABLE devices ADD COLUMN coord_y INTEGER")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    try:
+        cursor.execute("ALTER TABLE devices ADD COLUMN telemetry_port INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_devices_last_seen
         ON devices (last_seen)
@@ -516,17 +583,20 @@ async def process_discovery(disc: messages_pb2.DiscoveryResponse, ip: str):
 
         await db.execute("""
             INSERT INTO devices
-            (device_id, type, status, ip_address, control_port, is_controllable, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (device_id, type, status, ip_address, control_port, is_controllable, last_seen, aggregator_id, coord_x, coord_y)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 type            = excluded.type,
                 status          = excluded.status,
                 ip_address      = excluded.ip_address,
                 control_port    = excluded.control_port,
                 is_controllable = excluded.is_controllable,
-                last_seen       = excluded.last_seen
+                last_seen       = excluded.last_seen,
+                aggregator_id   = excluded.aggregator_id,
+                coord_x         = excluded.coord_x,
+                coord_y         = excluded.coord_y
         """, (disc.device_id, disc.type, disc.initial_status, effective_ip,
-              disc.control_port, int(disc.is_controllable), now))
+              disc.control_port, int(disc.is_controllable), now, disc.aggregator_id, disc.coord_x, disc.coord_y))
         await db.commit()
 
     if existing_device is None:
@@ -542,86 +612,68 @@ async def process_discovery(disc: messages_pb2.DiscoveryResponse, ip: str):
         )
 
 
-# ====================================================================
-# CAMADA DE REDE: INGESTÃO E DESCOBERTA (MULTIPLEXAÇÃO FÍSICA UDP)
-# ====================================================================
-
-class TelemetryUDPProtocol(asyncio.DatagramProtocol):
-    """Protocolo de transporte focado estritamente na ingestão contínua (Porta 5000)."""
-
-    def connection_made(self, transport):
-        self.transport = transport
-        log.info("Interface de Telemetria ativa na porta %d.", UDP_TELEMETRY_PORT)
-
-    def datagram_received(self, data: bytes, addr: Tuple[str, int]):
-        """Decodifica estritamente fluxos operacionais DataPayload."""
-
-        # Tenta extrair datagramas de Telemetria (Métricas Físicas)
-        try:
-            payload = messages_pb2.DataPayload()
-            payload.ParseFromString(data)
-
-            # Acesso correto aos enumeradores Protobuf exportados em módulo
-            if payload.device_id and (
-                payload.current_status != messages_pb2.STATUS_UNKNOWN
-                or len(payload.metrics) > 0
-            ):
-                last_info = LAST_MESSAGE_INFO.get(payload.device_id)
-                if last_info is not None:
-                    last_ts, last_msg_id = last_info
-                    if payload.timestamp < last_ts:
-                        log.warning(
-                            "Mensagem atrasada de '%s' (ts=%d) ignorada. Último ts=%d.",
-                            payload.device_id, payload.timestamp, last_ts,
-                        )
-                        return
-                    if payload.timestamp == last_ts and payload.message_id == last_msg_id:
-                        log.debug("Mensagem duplicada de '%s' ignorada.", payload.device_id)
-                        return
-
-                # Evicção LRU: manter máximo de 1000 entradas em LAST_MESSAGE_INFO
-                # `while` em vez de `if` — garante que o dict nunca
-                # ultrapasse 1000 entradas mesmo em inserções simultâneas.
-                while len(LAST_MESSAGE_INFO) >= 1000:
-                    LAST_MESSAGE_INFO.popitem(last=False)
-                
-                LAST_MESSAGE_INFO[payload.device_id] = (payload.timestamp, payload.message_id)
-                # Guarda referência forte para evitar coleta pelo GC
-                # antes da task completar (event loop mantém apenas refs fracas).
-                task = asyncio.create_task(process_telemetry(payload, addr[0]))
-                _BACKGROUND_TASKS.add(task)
-                task.add_done_callback(_BACKGROUND_TASKS.discard)
-                log.debug(
-                    "Pacote ID [%s] de '%s' — atraso %ds.",
-                    payload.message_id, payload.device_id,
-                    int(time.time()) - payload.timestamp,
-                )
-                return
-        except Exception as exc:
-            log.debug("Datagrama de telemetria inválido de %s: %s", addr, exc)
+async def redis_telemetry_loop():
+    """Consome a stream de telemetria do Redis de forma contínua."""
+    log.info("Iniciando consumo de telemetria via Redis Stream...")
+    client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+    last_id = "0"
+    try:
+        while True:
+            try:
+                events = await client.xread({"telemetry_stream": last_id}, count=100, block=1000)
+                for stream, messages in events:
+                    for msg_id, data in messages:
+                        last_id = msg_id
+                        raw_payload = data[b'payload']
+                        try:
+                            decrypted = decrypt_payload(raw_payload)
+                            payload = messages_pb2.DataPayload()
+                            payload.ParseFromString(decrypted)
+                            task = asyncio.create_task(process_telemetry(payload, "0.0.0.0"))
+                            _BACKGROUND_TASKS.add(task)
+                            task.add_done_callback(_BACKGROUND_TASKS.discard)
+                        except Exception as e:
+                            log.debug("Datagrama de telemetria inválido do Redis: %s", e)
+            except Exception as e:
+                log.error("Erro ao ler telemetry_stream: %s", e)
+                await asyncio.sleep(2)
+    except asyncio.CancelledError:
+        await client.close()
+        raise
 
 
-class DiscoveryUDPProtocol(asyncio.DatagramProtocol):
-    """Protocolo de transporte focado no registro de topologia (Porta 5002)."""
-
-    def connection_made(self, transport):
-        self.transport = transport
-        log.info("Interface de Descoberta ativa na porta %d.", UDP_DISCOVERY_PORT)
-
-    def datagram_received(self, data: bytes, addr: Tuple[str, int]):
-        """Decodifica estritamente fluxos de handshake e heartbeat."""
-        try:
-            disc = messages_pb2.DiscoveryResponse()
-            disc.ParseFromString(data)
-
-            # Aceita dispositivos não-controláveis validando apenas o device_id
-            if disc.device_id:
-                # [FIX BUG-01] Idem: referência forte evita GC prematuro da task.
-                task = asyncio.create_task(process_discovery(disc, addr[0]))
-                _BACKGROUND_TASKS.add(task)
-                task.add_done_callback(_BACKGROUND_TASKS.discard)
-        except Exception as e:
-            log.error("Falha na decodificação de datagrama de Descoberta %s: %s", addr, e)
+async def redis_discovery_loop():
+    """Consome a stream de descoberta do Redis."""
+    log.info("Iniciando consumo de discovery via Redis Stream...")
+    client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+    last_id = "0"
+    try:
+        while True:
+            try:
+                events = await client.xread({"discovery_stream": last_id}, count=100, block=1000)
+                for stream, messages in events:
+                    for msg_id, data in messages:
+                        last_id = msg_id
+                        raw_payload = data[b'payload']
+                        aggregator_id = data.get(b'aggregator', b'').decode('utf-8')
+                        try:
+                            decrypted = decrypt_payload(raw_payload)
+                            disc = messages_pb2.DiscoveryResponse()
+                            disc.ParseFromString(decrypted)
+                            if aggregator_id:
+                                disc.aggregator_id = aggregator_id
+                            if disc.device_id:
+                                task = asyncio.create_task(process_discovery(disc, "0.0.0.0"))
+                                _BACKGROUND_TASKS.add(task)
+                                task.add_done_callback(_BACKGROUND_TASKS.discard)
+                        except Exception as e:
+                            log.debug("Datagrama de descoberta inválido do Redis: %s", e)
+            except Exception as e:
+                log.error("Erro ao ler discovery_stream: %s", e)
+                await asyncio.sleep(2)
+    except asyncio.CancelledError:
+        await client.close()
+        raise
 
 
 async def multicast_discovery_probe_loop():
@@ -682,14 +734,34 @@ async def device_offline_monitor_loop():
             # conexão ainda está checada para uso. Acessá-lo após o bloco é frágil
             # pois a conexão pode ser reutilizada por outra corrotina.
             marked_offline = 0
+            offline_devices = []
             async with get_db_pool().connection() as db:
                 cursor = await db.execute("""
+                    SELECT aggregator_id, telemetry_port FROM devices
+                    WHERE last_seen < ? AND status != ? AND telemetry_port > 0
+                """, (cutoff, messages_pb2.STATUS_OFF))
+                offline_devices = await cursor.fetchall()
+                
+                cursor = await db.execute("""
                     UPDATE devices
-                    SET status = ?
+                    SET status = ?, telemetry_port = 0
                     WHERE last_seen < ? AND status != ?
                 """, (messages_pb2.STATUS_OFF, cutoff, messages_pb2.STATUS_OFF))
                 await db.commit()
                 marked_offline = cursor.rowcount
+
+            if offline_devices:
+                try:
+                    client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+                    for agg_id, port in offline_devices:
+                        if MIN_DYNAMIC_PORT <= port < (MIN_DYNAMIC_PORT + MAX_AVAILABLE_PORTS):
+                            _AVAILABLE_PORTS.add(port)
+                            if agg_id:
+                                await client.lpush(f"agg_control_{agg_id}", f"FECHAR_PORTA_UDP: {port}")
+                    await client.close()
+                    log.info("Liberadas %d porta(s) UDP de dispositivos offline.", len(offline_devices))
+                except Exception as e:
+                    log.error("Erro ao publicar FECHAR_PORTA_UDP no Redis: %s", e)
 
             if marked_offline > 0:
                 log.warning(
@@ -750,6 +822,77 @@ def new_client_response(success: bool = True) -> messages_pb2.ClientResponse:
     resp.message_id = f"GW-RESP-{uuid.uuid4().hex[:8]}"
     resp.timestamp  = int(time.time())
     return resp
+
+async def handle_auth_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    peer = writer.get_extra_info('peername')
+    log.info("Nova conexao de Autenticacao de %s", peer)
+    try:
+        raw_len = await asyncio.wait_for(reader.readexactly(4), timeout=5.0)
+        msg_len = struct.unpack("!I", raw_len)[0]
+        payload = await asyncio.wait_for(reader.readexactly(msg_len), timeout=5.0)
+        
+        req = messages_pb2.AuthRequest()
+        req.ParseFromString(payload)
+        
+        expected_hex = _HEX_SERVICE_CODES.get(req.type)
+        if not expected_hex or expected_hex != req.hex_service_code:
+            raise InvalidHexServiceCodeException(f"Hex invalido: esperado {expected_hex}, recebido {req.hex_service_code}")
+            
+        if req.license_key_part not in GATEWAY_LICENSE_KEY:
+            raise InvalidLicenseKeyException(f"Chave de licenca invalida")
+            
+        aggregator_id = None
+        for _ in range(3):
+            async with get_db_pool().connection() as db:
+                async with db.execute("SELECT aggregator_id FROM devices WHERE device_id = ?", (req.device_id,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row and row[0]:
+                        aggregator_id = row[0]
+                        break
+            await asyncio.sleep(1.0)
+            
+        if not aggregator_id:
+            raise Exception("Dispositivo nao encontrado via Discovery ainda. Agregador desconhecido.")
+            
+        port = allocate_dynamic_port()
+        
+        async with get_db_pool().connection() as db:
+            await db.execute("UPDATE devices SET telemetry_port = ? WHERE device_id = ?", (port, req.device_id))
+            await db.commit()
+        
+        client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+        await client.lpush(f"agg_control_{aggregator_id}", f"ABRIR_PORTA_UDP: {port}")
+        await client.close()
+        
+        resp = messages_pb2.AuthResponse()
+        resp.success = True
+        resp.message = "OK"
+        resp.assigned_port = port
+        
+        resp_payload = resp.SerializeToString()
+        writer.write(struct.pack("!I", len(resp_payload)))
+        writer.write(resp_payload)
+        await writer.drain()
+        
+        log.info("Auth SUCCESS: %s porta alocada %d no agregador %s", req.device_id, port, aggregator_id)
+        
+    except Exception as e:
+        log.error("Auth FAIL para %s: %s", peer, e)
+        resp = messages_pb2.AuthResponse()
+        resp.success = False
+        resp.message = str(e)
+        resp.assigned_port = 0
+        resp_payload = resp.SerializeToString()
+        writer.write(struct.pack("!I", len(resp_payload)))
+        writer.write(resp_payload)
+        try:
+            await writer.drain()
+        except:
+            pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
 
 
 @dataclass(slots=True)
@@ -962,6 +1105,101 @@ async def execute_olap_from_source(
             sample_count=sample_count,
         )
 
+    if req.query_op in (messages_pb2.OP_ANOMALY_DETECTION, messages_pb2.OP_PERCENTILE_95, messages_pb2.OP_LINEAR_TREND):
+        graph_rows = await fetch_graph_rows(
+            db, source, req.query_metric, req.start_timestamp, req.end_timestamp, req.target_device_id,
+        )
+        bucket_label = f", bucket={source.bucket_size}s" if source.is_rollup else ""
+
+        if not graph_rows:
+            return OlapQueryResult(
+                success=False,
+                message="Dados insuficientes para análise avançada.",
+                analytics_result=0.0,
+                result_metadata="",
+                graph_rows=[],
+                sample_count=0,
+            )
+
+        values = [r.value for r in graph_rows]
+        sample_count = len(values)
+
+        if req.query_op == messages_pb2.OP_ANOMALY_DETECTION:
+            mean = sum(values) / sample_count
+            variance = sum((v - mean) ** 2 for v in values) / sample_count
+            std_dev = variance ** 0.5
+            threshold = 3 * std_dev
+            
+            anomalies = [r for r in graph_rows if abs(r.value - mean) > threshold]
+            anomaly_count = len(anomalies)
+            
+            return OlapQueryResult(
+                success=True,
+                message="",
+                analytics_result=float(anomaly_count),
+                result_metadata=(
+                    f"Fonte OLAP: {source.name}{bucket_label}. "
+                    f"Anomalias (Z-Score > 3): {anomaly_count} de {sample_count} amostras analisadas."
+                ),
+                graph_rows=anomalies,
+                sample_count=sample_count,
+            )
+
+        if req.query_op == messages_pb2.OP_PERCENTILE_95:
+            sorted_values = sorted(values)
+            idx = int(0.95 * sample_count)
+            if idx >= sample_count: idx = sample_count - 1
+            p95 = sorted_values[idx]
+            
+            return OlapQueryResult(
+                success=True,
+                message="",
+                analytics_result=p95,
+                result_metadata=(
+                    f"Fonte OLAP: {source.name}{bucket_label}. "
+                    f"Percentil 95 calculado sobre {sample_count} pontos agregados."
+                ),
+                graph_rows=graph_rows,
+                sample_count=sample_count,
+            )
+
+        if req.query_op == messages_pb2.OP_LINEAR_TREND:
+            if sample_count < 2:
+                return OlapQueryResult(
+                    success=False,
+                    message="Dados insuficientes para calcular tendência (mínimo 2 pontos).",
+                    analytics_result=0.0,
+                    result_metadata="",
+                    graph_rows=graph_rows,
+                    sample_count=sample_count,
+                )
+                
+            x_values = [r.timestamp for r in graph_rows]
+            x_min = min(x_values)
+            x_norm = [x - x_min for x in x_values]
+            
+            sum_x = sum(x_norm)
+            sum_y = sum(values)
+            sum_xy = sum(x * y for x, y in zip(x_norm, values))
+            sum_xx = sum(x * x for x in x_norm)
+            
+            denominator = (sample_count * sum_xx) - (sum_x * sum_x)
+            slope = 0.0
+            if denominator != 0:
+                slope = ((sample_count * sum_xy) - (sum_x * sum_y)) / denominator
+                
+            return OlapQueryResult(
+                success=True,
+                message="",
+                analytics_result=slope,
+                result_metadata=(
+                    f"Fonte OLAP: {source.name}{bucket_label}. "
+                    f"Tendência Linear (Slope): {slope:.6f} unidades/segundo."
+                ),
+                graph_rows=graph_rows,
+                sample_count=sample_count,
+            )
+
     return OlapQueryResult(
         success=False,
         message=f"Operação analítica desconhecida: {req.query_op}.",
@@ -1002,11 +1240,11 @@ async def build_client_response(
             # [R1] Colunas explícitas — resistente a mudanças futuras de schema
             async with db.execute("""
                 SELECT device_id, type, status, ip_address,
-                       control_port, is_controllable, last_seen
+                       control_port, is_controllable, last_seen, aggregator_id, coord_x, coord_y
                 FROM devices
             """) as cursor:
                 async for row in cursor:
-                    device_id, dtype, status, ip, ctrl_port, is_ctrl, last_seen = row
+                    device_id, dtype, status, ip, ctrl_port, is_ctrl, last_seen, agg_id, cx, cy = row
                     d = resp.devices.add()
                     d.device_id           = device_id
                     d.type                = dtype
@@ -1015,6 +1253,10 @@ async def build_client_response(
                     d.control_port        = ctrl_port
                     d.is_controllable     = bool(is_ctrl)
                     d.last_seen_timestamp = last_seen
+                    d.coord_x = cx if cx is not None else 0
+                    d.coord_y = cy if cy is not None else 0
+                    if agg_id:
+                        d.aggregator_id = agg_id
 
         resp.message = "Sincronização de topologia extraída via pool aiosqlite."
         log.info("LIST_DEVICES → %d nós retornados para %s.", len(resp.devices), peer)
@@ -1233,16 +1475,15 @@ async def main():
 
     loop = asyncio.get_running_loop()
 
-    # Provisionando as instâncias de transporte baseadas na segregação de portas
-    telemetry_transport, _ = await loop.create_datagram_endpoint(
-        TelemetryUDPProtocol, local_addr=("0.0.0.0", UDP_TELEMETRY_PORT)
-    )
-    discovery_transport, _ = await loop.create_datagram_endpoint(
-        DiscoveryUDPProtocol, local_addr=("0.0.0.0", UDP_DISCOVERY_PORT)
-    )
+    # Tarefas de leitura do Redis (Substitui datagram endpoints)
+    redis_tel_task  = asyncio.create_task(redis_telemetry_loop())
+    redis_disc_task = asyncio.create_task(redis_discovery_loop())
 
     # Servidor de Controle TCP
     server = await asyncio.start_server(handle_client_request, "0.0.0.0", TCP_PORT)
+    
+    # Servidor de Autenticação TCP
+    auth_server = await asyncio.start_server(handle_auth_client, "0.0.0.0", AUTH_PORT)
 
     # Tasks de background
     probe_task      = asyncio.create_task(multicast_discovery_probe_loop())
@@ -1252,13 +1493,13 @@ async def main():
     retention_task  = asyncio.create_task(metrics_retention_loop())
 
     log.info(
-        "Hub pronto. TCP:%d | UDP(Telem):%d | UDP(Disc):%d",
-        TCP_PORT, UDP_TELEMETRY_PORT, UDP_DISCOVERY_PORT,
+        "Hub pronto. TCP:%d | Lendo dados do Redis (%s:%d)",
+        TCP_PORT, REDIS_HOST, REDIS_PORT,
     )
 
     try:
-        async with server:
-            await server.serve_forever()
+        async with server, auth_server:
+            await asyncio.gather(server.serve_forever(), auth_server.serve_forever())
     finally:
         # Cancela tasks UDP em voo (telemetria/descoberta) antes de fechar
         # os transportes e o pool. Sem isso, tasks que chegaram no último instante
@@ -1273,12 +1514,13 @@ async def main():
         offline_task.cancel()
         telemetry_task.cancel()
         retention_task.cancel()
+        redis_tel_task.cancel()
+        redis_disc_task.cancel()
         await asyncio.gather(
             probe_task, checkpoint_task, offline_task, telemetry_task, retention_task,
+            redis_tel_task, redis_disc_task,
             return_exceptions=True,
         )
-        telemetry_transport.close()
-        discovery_transport.close()
         await DB_POOL.close()
         DB_POOL = None
         TELEMETRY_QUEUE = None

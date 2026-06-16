@@ -12,9 +12,12 @@ from contextlib import closing
 import messages_pb2  # pyright: ignore[reportMissingImports]
 
 
-GATEWAY_HOST = "gateway"
+GATEWAY_HOST = os.getenv("GATEWAY_HOST", "gateway")
 GATEWAY_TELEMETRY_PORT = 5000
 GATEWAY_DISCOVERY_PORT = 5002
+AUTH_TCP_PORT = 5007
+SENSOR_LICENSE_PART = os.getenv("SENSOR_LICENSE_PART", "V1-FULL")
+SENSOR_HEX_CODE = "0D"
 
 CONTROL_TCP_PORT = 5004
 MULTICAST_GROUP = "239.0.0.1"
@@ -24,9 +27,19 @@ SECTORS = (
     ("Pici", "pici"),
     ("Benfica", "benfica"),
     ("Porangabussu", "porangabussu"),
+    ("Labomar", "labomar"),
 )
 CAMERA_DEVICE_COUNT = max(1, int(os.getenv("CAMERA_DEVICE_COUNT", str(len(SECTORS)))))
-DEVICE_HOSTNAME = "sensor_camera"
+def get_local_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((GATEWAY_HOST, 5000))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+DEVICE_IP = get_local_ip()
+DEVICE_HOSTNAME = DEVICE_IP
 
 
 def env_float(name: str, default: float, min_value: float) -> float:
@@ -64,6 +77,9 @@ TRAFFIC_INFRACTIONS_THRESHOLD = int(os.getenv("TRAFFIC_INFRACTIONS_THRESHOLD", "
 shutdown_event = threading.Event()
 state_lock = threading.Lock()
 
+best_aggregator_ip = GATEWAY_HOST
+best_aggregator_score = 999999.0
+
 # Fila de probes de descoberta recebidos via multicast.
 # O multicast_listener_loop enfileira o instante monotônico em que a resposta
 # deve ser enviada (agora + jitter). O probe_dispatch_loop consome a fila em
@@ -78,6 +94,15 @@ def build_device_fleet(count: int) -> dict[str, dict]:
         sector_name, sector_slug = SECTORS[idx % len(SECTORS)]
         sector_ordinal = (idx // len(SECTORS)) + 1
         device_id = f"camera_{sector_slug}_{sector_ordinal:02d}"
+        if sector_slug == "pici":
+            cx, cy = random.randint(0, 40), random.randint(0, 60)
+        elif sector_slug == "benfica":
+            cx, cy = random.randint(50, 90), random.randint(0, 30)
+        elif sector_slug == "porangabussu":
+            cx, cy = random.randint(60, 100), random.randint(50, 90)
+        else: # labomar
+            cx, cy = random.randint(0, 30), random.randint(70, 100)
+
         devices[device_id] = {
             "device_id": device_id,
             "sector": sector_name,
@@ -87,6 +112,8 @@ def build_device_fleet(count: int) -> dict[str, dict]:
             "next_threshold_check_at": 0.0,
             "last_threshold_send_at": 0.0,
             "manual_until": 0.0,
+            "coord_x": cx,
+            "coord_y": cy,
         }
     return devices
 
@@ -109,8 +136,8 @@ def random_device_status() -> int:
 
 
 def retry_delay_secs(attempt: int) -> float:
-    backoff = min(MAX_RETRY_DELAY_SECS, BASE_RETRY_DELAY_SECS * (2 ** attempt))
-    return backoff + random.uniform(0, BASE_RETRY_DELAY_SECS)
+    temp = min(MAX_RETRY_DELAY_SECS, BASE_RETRY_DELAY_SECS * (2 ** attempt))
+    return random.uniform(0, temp)
 
 
 def telemetry_wait_secs(frequency_secs: int) -> float:
@@ -129,11 +156,14 @@ def send_udp_message(message, port: int) -> None:
     data = message.SerializeToString()
     last_error = None
 
+    with state_lock:
+        target_ip = best_aggregator_ip
+
     for attempt in range(MAX_UDP_SEND_ATTEMPTS):
         try:
             with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
                 sock.settimeout(1.0)
-                sock.sendto(data, (GATEWAY_HOST, port))
+                sock.sendto(data, (target_ip, port))
             return
         except OSError as exc:
             last_error = exc
@@ -185,6 +215,8 @@ def send_discovery_response(target_device_id: str | None = None) -> None:
             control_port=CONTROL_TCP_PORT,
             initial_status=current_status,
             is_controllable=True,
+            coord_x=device["coord_x"],
+            coord_y=device["coord_y"],
         )
 
         try:
@@ -260,6 +292,8 @@ def emit_telemetry_payload(
         timestamp=int(time.time()),
         device_id=current_device_id,
         current_status=current_status,
+        coord_x=DEVICES[current_device_id]["coord_x"],
+        coord_y=DEVICES[current_device_id]["coord_y"],
     )
     payload.metrics.extend(metrics)
 
@@ -405,6 +439,37 @@ def handle_control_client(conn: socket.socket, addr) -> None:
     finally:
         conn.close()
 
+def authenticate_with_gateway() -> int:
+    print(f"[sensor_camera] | [Auth] Iniciando autenticacao TCP com Gateway ({GATEWAY_HOST}:{AUTH_TCP_PORT})...")
+    time.sleep(1.0)
+    
+    req = messages_pb2.AuthRequest()
+    req.device_id = DEVICE_ID
+    req.type = messages_pb2.DEVICE_TYPE_CAMERA
+    req.license_key_part = SENSOR_LICENSE_PART
+    req.hex_service_code = SENSOR_HEX_CODE
+    
+    payload = req.SerializeToString()
+    try:
+        with socket.create_connection((GATEWAY_HOST, AUTH_TCP_PORT), timeout=10) as sock:
+            sock.sendall(struct.pack("!I", len(payload)) + payload)
+            
+            raw_len = recv_exact(sock, 4)
+            msg_len = struct.unpack("!I", raw_len)[0]
+            resp_payload = recv_exact(sock, msg_len)
+            
+            resp = messages_pb2.AuthResponse()
+            resp.ParseFromString(resp_payload)
+            
+            if not resp.success:
+                print(f"[sensor_camera] | [Auth] FALHA na validacao: {resp.message}")
+                os._exit(1)
+                
+            print(f"[Auth] Gateway encontrado! Tipo: sensor_camera, Chave: '{SENSOR_LICENSE_PART}-{SENSOR_HEX_CODE}'. Validação: SUCESSO. Porta alocada e conectada: {resp.assigned_port}.")
+            return resp.assigned_port
+    except Exception as e:
+        print(f"[sensor_camera] | [Auth] Erro ao conectar/autenticar com Gateway: {e}")
+        os._exit(1)
 
 def control_server_loop() -> None:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as server:
@@ -477,6 +542,21 @@ def multicast_listener_loop() -> None:
                         f"[sensor_camera] | [Sensor Python:Multicast] Fila cheia "
                         f"({_probe_dispatch_queue.maxsize} itens) — probe de {addr[0]} descartado."
                     )
+            else:
+                try:
+                    loadMsg = messages_pb2.AggregatorLoad()
+                    loadMsg.ParseFromString(data)
+                    score = (loadMsg.cpu_load * 0.4) + (loadMsg.queue_size * 0.6)
+                    
+                    global best_aggregator_ip, best_aggregator_score
+                    with state_lock:
+                        if score < best_aggregator_score or best_aggregator_ip == loadMsg.ip_address:
+                            if best_aggregator_ip != loadMsg.ip_address:
+                                print(f"[sensor_camera] | [Sensor Python:LoadBalancer] Rota alterada para {loadMsg.aggregator_id} (Score: {best_aggregator_score:.2f} -> {score:.2f})")
+                                best_aggregator_ip = loadMsg.ip_address
+                            best_aggregator_score = score
+                except Exception as e:
+                    pass
 
 
 def probe_dispatch_loop() -> None:
@@ -573,10 +653,17 @@ def main() -> None:
 
     threading.Thread(target=control_server_loop, daemon=True).start()
     threading.Thread(target=multicast_listener_loop, daemon=True).start()
-    threading.Thread(target=probe_dispatch_loop, daemon=True).start()
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
 
     send_discovery_response()
+    
+    assigned_port = authenticate_with_gateway()
+    global GATEWAY_TELEMETRY_PORT
+    GATEWAY_TELEMETRY_PORT = assigned_port
+    
+    time.sleep(2.0)
+
+    threading.Thread(target=probe_dispatch_loop, daemon=True).start()
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
 
     while not shutdown_event.is_set():
         for device_id in threshold_due_device_ids():

@@ -11,17 +11,26 @@ public class sensor {
     private static final String[][] SECTORS = {
         {"Pici", "pici"},
         {"Benfica", "benfica"},
-        {"Porangabussu", "porangabussu"}
+        {"Porangabussu", "porangabussu"},
+        {"Labomar", "labomar"}
     };
     private static final int DEVICE_COUNT = Math.max(1, Integer.parseInt(System.getenv().getOrDefault("JAVA_DEVICE_COUNT", String.valueOf(SECTORS.length))));
     private static final java.util.Map<String, DeviceState> DEVICES = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.List<String> DEVICE_ORDER = new java.util.concurrent.CopyOnWriteArrayList<>();
     private static final String DEFAULT_DEVICE_ID;
-    private static final String GATEWAY_HOST = "gateway";
+    private static volatile String GATEWAY_HOST = "gateway";
+    private static volatile double BEST_AGGREGATOR_SCORE = 999999.0;
     private static final String DEVICE_HOSTNAME;
     static {
         String h = "sensor_semaforo";
-        try { h = InetAddress.getLocalHost().getHostName(); } catch (Exception ignored) {}
+        try {
+            String gw = System.getenv().getOrDefault("GATEWAY_HOST", "gateway");
+            InetAddress gwAddress = InetAddress.getByName(gw);
+            try (DatagramSocket socket = new DatagramSocket()) {
+                socket.connect(gwAddress, 5000);
+                h = socket.getLocalAddress().getHostAddress();
+            }
+        } catch (Exception ignored) {}
         DEVICE_HOSTNAME = h;
     }
 
@@ -39,8 +48,11 @@ public class sensor {
     }
 
     // Portas segregadas para multiplexação espacial UDP
-    private static final int GATEWAY_TELEMETRY_PORT = 5000;
+    private static int GATEWAY_TELEMETRY_PORT = 5000;
     private static final int GATEWAY_DISCOVERY_PORT = 5002;
+    private static final int AUTH_TCP_PORT = 5007;
+    private static final String SENSOR_LICENSE_PART = System.getenv().getOrDefault("SENSOR_LICENSE_PART", "V1-FULL");
+    private static final String SENSOR_HEX_CODE = "0A";
 
     private static final int CONTROL_TCP_PORT = 5003;
     private static final String MULTICAST_GROUP = "239.0.0.1";
@@ -66,6 +78,8 @@ public class sensor {
     private static class DeviceState {
         final String deviceId;
         final String sector;
+        final int coordX;
+        final int coordY;
         volatile int currentStatus = Messages.DeviceStatus.STATUS_ON_VALUE;
         volatile int frequencySecs = 5;
         volatile long nextSendAtMillis = 0L;
@@ -73,9 +87,11 @@ public class sensor {
         volatile long lastThresholdSendAtMillis = 0L;
         volatile long manualUntilMillis = 0L;
 
-        DeviceState(String deviceId, String sector) {
+        DeviceState(String deviceId, String sector, int coordX, int coordY) {
             this.deviceId = deviceId;
             this.sector = sector;
+            this.coordX = coordX;
+            this.coordY = coordY;
         }
     }
 
@@ -101,9 +117,22 @@ public class sensor {
         for (int i = 0; i < DEVICE_COUNT; i++) {
             int sectorIdx = i % SECTORS.length;
             int sectorOrdinal = (i / SECTORS.length) + 1;
-            String deviceId = "semaforo_" + SECTORS[sectorIdx][1] + "_"
+            String sectorSlug = SECTORS[sectorIdx][1];
+            String deviceId = "semaforo_" + sectorSlug + "_"
                 + String.format("%02d", sectorOrdinal);
-            DeviceState device = new DeviceState(deviceId, SECTORS[sectorIdx][0]);
+            
+            int cx = 0, cy = 0;
+            if (sectorSlug.equals("pici")) {
+                cx = RNG.nextInt(41); cy = RNG.nextInt(61);
+            } else if (sectorSlug.equals("benfica")) {
+                cx = 50 + RNG.nextInt(41); cy = RNG.nextInt(31);
+            } else if (sectorSlug.equals("porangabussu")) {
+                cx = 60 + RNG.nextInt(41); cy = 50 + RNG.nextInt(41);
+            } else { // labomar
+                cx = RNG.nextInt(31); cy = 70 + RNG.nextInt(31);
+            }
+
+            DeviceState device = new DeviceState(deviceId, SECTORS[sectorIdx][0], cx, cy);
             DEVICES.put(deviceId, device);
             DEVICE_ORDER.add(deviceId);
         }
@@ -121,6 +150,9 @@ public class sensor {
 
         // 1. Injeção do Handshake inicial na rede de descoberta
         sendDiscovery();
+
+        GATEWAY_TELEMETRY_PORT = authenticateWithGateway();
+        try { Thread.sleep(2000); } catch (Exception e) {}
 
         // 2. Alocação da Thread de Controle TCP (Atuação remota)
         new Thread(sensor::startTcpServer).start();
@@ -140,15 +172,15 @@ public class sensor {
     // ====================================================================
 
     private static long retryDelayMillis(int attempt) {
-        long delay = RETRY_BASE_DELAY_MS;
+        long temp = RETRY_BASE_DELAY_MS;
         for (int i = 0; i < attempt; i++) {
-            delay *= 2;
-            if (delay >= RETRY_MAX_DELAY_MS) {
-                delay = RETRY_MAX_DELAY_MS;
+            temp *= 2;
+            if (temp >= RETRY_MAX_DELAY_MS) {
+                temp = RETRY_MAX_DELAY_MS;
                 break;
             }
         }
-        return delay + RNG.nextInt((int) RETRY_BASE_DELAY_MS + 1);
+        return RNG.nextInt((int) temp + 1);
     }
 
     private static long telemetryDelayMillis(int frequencySecs) {
@@ -276,6 +308,8 @@ public class sensor {
                 .setControlPort(CONTROL_TCP_PORT)
                 .setIsControllable(true)
                 .setInitialStatus(Messages.DeviceStatus.forNumber(device.currentStatus))
+                .setCoordX(device.coordX)
+                .setCoordY(device.coordY)
                 .build();
 
             byte[] buf = disc.toByteArray();
@@ -295,6 +329,48 @@ public class sensor {
             System.err.println("[sensor_semaforo] | [Sensor Java:Erro] Falha ao preparar descoberta de "
                 + device.deviceId + ": " + cleanNetworkError(e));
         }
+    }
+
+    private static int authenticateWithGateway() {
+        System.out.println("[sensor_semaforo] | [Auth] Iniciando autenticacao TCP com Gateway (" + GATEWAY_HOST + ":" + AUTH_TCP_PORT + ")...");
+        try { Thread.sleep(1000); } catch (Exception e) {}
+        
+        try {
+            InetAddress gwAddress = InetAddress.getByName(GATEWAY_HOST);
+            try (Socket s = new Socket()) {
+                s.connect(new InetSocketAddress(gwAddress, AUTH_TCP_PORT), 10000);
+                DataOutputStream out = new DataOutputStream(s.getOutputStream());
+                DataInputStream in = new DataInputStream(s.getInputStream());
+                
+                Messages.AuthRequest req = Messages.AuthRequest.newBuilder()
+                    .setDeviceId(DEFAULT_DEVICE_ID)
+                    .setType(Messages.DeviceType.DEVICE_TYPE_TRAFFIC_LIGHT)
+                    .setLicenseKeyPart(SENSOR_LICENSE_PART)
+                    .setHexServiceCode(SENSOR_HEX_CODE)
+                    .build();
+                    
+                byte[] payload = req.toByteArray();
+                out.writeInt(payload.length);
+                out.write(payload);
+                
+                int respLen = in.readInt();
+                byte[] respPayload = new byte[respLen];
+                in.readFully(respPayload);
+                
+                Messages.AuthResponse resp = Messages.AuthResponse.parseFrom(respPayload);
+                if (!resp.getSuccess()) {
+                    System.err.println("[sensor_semaforo] | [Auth] FALHA na validacao: " + resp.getMessage());
+                    System.exit(1);
+                }
+                
+                System.out.println("[Auth] Gateway encontrado! Tipo: sensor_semaforo, Chave: '" + SENSOR_LICENSE_PART + "-" + SENSOR_HEX_CODE + "'. Validação: SUCESSO. Porta alocada e conectada: " + resp.getAssignedPort() + ".");
+                return resp.getAssignedPort();
+            }
+        } catch (Exception e) {
+            System.err.println("[sensor_semaforo] | [Auth] Erro ao conectar/autenticar com Gateway: " + e.getMessage());
+            System.exit(1);
+        }
+        return GATEWAY_TELEMETRY_PORT;
     }
 
     private static void startHeartbeatLoop() {
@@ -442,6 +518,22 @@ public class sensor {
                         continue;
                     }
                     sendDiscovery();
+                } else {
+                    try {
+                        byte[] pureData = new byte[p.getLength()];
+                        System.arraycopy(p.getData(), 0, pureData, 0, p.getLength());
+                        Messages.AggregatorLoad loadMsg = Messages.AggregatorLoad.parseFrom(pureData);
+                        if (loadMsg != null && !loadMsg.getIpAddress().isEmpty()) {
+                            double score = (loadMsg.getCpuLoad() * 0.4) + (loadMsg.getQueueSize() * 0.6);
+                            if (score < BEST_AGGREGATOR_SCORE || GATEWAY_HOST.equals(loadMsg.getIpAddress())) {
+                                if (!GATEWAY_HOST.equals(loadMsg.getIpAddress())) {
+                                    System.out.printf(java.util.Locale.US, "[Sensor Java:LoadBalancer] Rota alterada para %s (Score: %.2f -> %.2f)\n", loadMsg.getAggregatorId(), BEST_AGGREGATOR_SCORE, score);
+                                    GATEWAY_HOST = loadMsg.getIpAddress();
+                                }
+                                BEST_AGGREGATOR_SCORE = score;
+                            }
+                        }
+                    } catch (Exception ignored) {}
                 }
             }
         } catch (Exception e) {
@@ -471,7 +563,9 @@ public class sensor {
             .setMessageId(msgId)
             .setTimestamp(now)
             .setDeviceId(device.deviceId)
-            .setCurrentStatus(Messages.DeviceStatus.forNumber(device.currentStatus));
+            .setCurrentStatus(Messages.DeviceStatus.forNumber(device.currentStatus))
+            .setCoordX(device.coordX)
+            .setCoordY(device.coordY);
 
         Integer queueLength = queueLengthOverride;
         if (device.currentStatus == Messages.DeviceStatus.STATUS_ON_VALUE) {

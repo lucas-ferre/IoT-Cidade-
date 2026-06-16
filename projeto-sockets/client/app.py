@@ -8,6 +8,8 @@ import uuid
 import datetime
 import threading
 import pandas as pd
+import requests
+import plotly.express as px
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -353,8 +355,11 @@ def _device_to_dict(d) -> dict:
         "status":             int(d.status),
         "ip_address":         d.ip_address,
         "control_port":       int(d.control_port),
+        "aggregator_id":      d.aggregator_id,
         "is_controllable":    bool(d.is_controllable),
         "last_seen_timestamp": int(d.last_seen_timestamp),
+        "coord_x":            int(d.coord_x),
+        "coord_y":            int(d.coord_y),
     }
 
 def check_gateway_status() -> bool:
@@ -372,6 +377,7 @@ def infer_sector_from_device_id(device_id: str) -> str:
         "pici": "Pici",
         "benfica": "Benfica",
         "porangabussu": "Porangabussu",
+        "labomar": "Labomar",
     }
     
     # Busca relaxada para não quebrar com nomes como "CameraPici01"
@@ -517,6 +523,30 @@ if 'inspection_context' not in st.session_state:
     st.session_state.inspection_context = None
 if 'inspection_error' not in st.session_state:
     st.session_state.inspection_error = None
+if "control_task" not in st.session_state:
+    st.session_state.control_task = None
+if "last_backup_time" not in st.session_state:
+    st.session_state.last_backup_time = ""
+
+def get_backup_status() -> str:
+    try:
+        resp = requests.get("http://backup_go:8080/backup/status", timeout=2)
+        if resp.status_code == 200:
+            return resp.json().get("last_backup_time", "")
+    except Exception:
+        pass
+    return ""
+
+def trigger_manual_backup():
+    try:
+        resp = requests.post("http://backup_go:8080/backup/trigger", timeout=5)
+        if resp.status_code == 200:
+            st.toast("Backup manual concluído com sucesso!", icon="✅")
+            st.session_state.last_backup_time = resp.json().get("last_backup_time", "")
+        else:
+            st.toast(f"Erro no backup: {resp.status_code}", icon="❌")
+    except Exception as e:
+        st.toast(f"Erro ao contatar serviço de backup: {e}", icon="❌")
 
 # ====================================================================
 # SIDEBAR
@@ -538,15 +568,22 @@ with st.sidebar:
     col2.metric("Sensores", sensor_count, help="Atualizar na aba Descoberta")
     col3.metric("Hora UTC", datetime.datetime.now(datetime.timezone.utc).strftime('%H:%M:%S'))
     st.markdown("---")
+    
+    st.subheader("💾 Backup Analítico (Go)")
+    if st.button("Realizar Backup Manual", use_container_width=True):
+        trigger_manual_backup()
+    
+    st.markdown("---")
     st.info("💡 Selecione uma aba para iniciar operações na rede.")
 
 st.divider()
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📡 Fontes de Dados (Descoberta)", 
     "⚙️ Painel de Atuação (Controle)", 
     "📊 Consultas Analíticas (OLAP)",
-    "🔍 Inspeção Individual (Sensor)"
+    "🔍 Inspeção Individual (Sensor)",
+    "🗺️ Mapa Interativo (Matriz)"
 ])
 
 # --------------------------------------------------------------------
@@ -580,6 +617,14 @@ with tab1:
 
     if st.button("Atualizar Topologia de Rede", type="primary", use_container_width=True,
                  disabled=is_tcp_task_pending("list_devices_task")):
+        
+        # Check automatic backup
+        current_backup = get_backup_status()
+        if current_backup and current_backup != st.session_state.last_backup_time:
+            if st.session_state.last_backup_time != "":
+                st.info(f"💾 Um novo backup foi gerado automaticamente às: {current_backup}")
+            st.session_state.last_backup_time = current_backup
+
         req = messages_pb2.ClientRequest()
         req.type = messages_pb2.REQUEST_TYPE_LIST_DEVICES
         submit_tcp_request("list_devices_task", req, {})
@@ -597,6 +642,7 @@ with tab1:
             #  Acesso via dict — os dados são agora dicts Python simples.
             device_data.append({
                 "ID": d["device_id"],
+                "Agregador": d.get("aggregator_id", "N/A"),
                 "Setor Geográfico": infer_sector_from_device_id(d["device_id"]),
                 "Classe do Dispositivo": TYPE_MAP.get(d["type"], "Desconhecido"),
                 "Status Atual": STATUS_MAP.get(d["status"], "Desconhecido"),
@@ -1156,3 +1202,108 @@ with tab4:
                 "executar a inspeção individual",
                 requires_gateway_db=True,
             ))
+# --------------------------------------------------------------------
+# ABA 5: Mapa Interativo (Matriz)
+# --------------------------------------------------------------------
+with tab5:
+    st.subheader("🗺️ Mapa Interativo da Universidade (Matriz 100x100)")
+    
+    if "device_history" not in st.session_state or not st.session_state.device_history:
+        st.info("Nenhum dispositivo encontrado. Vá para a aba 'Fontes de Dados' e atualize a topologia.")
+    else:
+        df_map = pd.DataFrame(st.session_state.device_history)
+        
+        # Filtros
+        col_filters1, col_filters2 = st.columns(2)
+        with col_filters1:
+            map_mode = st.radio("Modo de Visualização", ["Gráfico de Dispersão (Scatter)", "Mapa de Calor (Heatmap)"], horizontal=True)
+        with col_filters2:
+            device_types = df_map["type"].unique()
+            selected_types = st.multiselect("Filtrar por Tipo de Sensor", 
+                options=device_types, 
+                default=device_types,
+                format_func=lambda x: {
+                    messages_pb2.DEVICE_TYPE_CAMERA: "Câmera (Python)",
+                    messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT: "Semáforo (Java)",
+                    messages_pb2.DEVICE_TYPE_LAMP_POST: "Poste Inteligente (Lua)",
+                    messages_pb2.DEVICE_TYPE_ENV_STATION: "Estação Ambiental (C)"
+                }.get(x, f"Desconhecido ({x})")
+            )
+        
+        if selected_types:
+            df_filtered = df_map[df_map["type"].isin(selected_types)].copy()
+            
+            # Map type to string for hover
+            df_filtered["type_str"] = df_filtered["type"].map(lambda x: {
+                    messages_pb2.DEVICE_TYPE_CAMERA: "Câmera",
+                    messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT: "Semáforo",
+                    messages_pb2.DEVICE_TYPE_LAMP_POST: "Poste Inteligente",
+                    messages_pb2.DEVICE_TYPE_ENV_STATION: "Estação Ambiental"
+                }.get(x, "Desconhecido")
+            )
+            df_filtered["status_str"] = df_filtered["status"].map(lambda x: {
+                    messages_pb2.STATUS_ON: "ON",
+                    messages_pb2.STATUS_OFF: "OFF",
+                    messages_pb2.STATUS_ERROR: "ERROR"
+                }.get(x, "UNKNOWN")
+            )
+
+            if df_filtered.empty:
+                st.warning("Nenhum dispositivo corresponde aos filtros.")
+            else:
+                if map_mode == "Gráfico de Dispersão (Scatter)":
+                    fig = px.scatter(
+                        df_filtered, 
+                        x="coord_x", 
+                        y="coord_y", 
+                        color="type_str",
+                        hover_name="device_id",
+                        hover_data={
+                            "type_str": True,
+                            "status_str": True,
+                            "coord_x": True,
+                            "coord_y": True,
+                            "ip_address": True,
+                            "aggregator_id": True
+                        },
+                        title="Localização dos Sensores (Matriz 100x100)",
+                        labels={"coord_x": "Coordenada X", "coord_y": "Coordenada Y", "type_str": "Tipo"},
+                        range_x=[0, 100],
+                        range_y=[0, 100],
+                        height=600
+                    )
+                    fig.update_traces(marker=dict(size=12, line=dict(width=2, color='DarkSlateGrey')))
+                else:
+                    fig = px.density_heatmap(
+                        df_filtered, 
+                        x="coord_x", 
+                        y="coord_y", 
+                        title="Densidade de Sensores (Heatmap)",
+                        labels={"coord_x": "Coordenada X", "coord_y": "Coordenada Y"},
+                        range_x=[0, 100],
+                        range_y=[0, 100],
+                        nbinsx=20,
+                        nbinsy=20,
+                        height=600
+                    )
+                
+                # Make interactive via st.plotly_chart
+                event = st.plotly_chart(fig, use_container_width=True, on_select="rerun")
+                
+                if map_mode == "Gráfico de Dispersão (Scatter)" and event and event.get("selection") and event["selection"]["points"]:
+                    selected_point = event["selection"]["points"][0]
+                    if "customdata" in selected_point:
+                        # Obter device_id correspondente
+                        idx = selected_point["pointIndex"]
+                        device_info = df_filtered.iloc[idx]
+                        
+                        st.markdown("### Detalhes do Sensor Selecionado")
+                        st.json({
+                            "ID do Dispositivo": device_info["device_id"],
+                            "Tipo": device_info["type_str"],
+                            "Status": device_info["status_str"],
+                            "Coordenadas": f"X:{device_info['coord_x']}, Y:{device_info['coord_y']}",
+                            "IP": device_info["ip_address"],
+                            "Agregador": device_info["aggregator_id"],
+                            "Última Vez Visto": datetime.datetime.fromtimestamp(device_info["last_seen_timestamp"]).strftime('%Y-%m-%d %H:%M:%S') if device_info["last_seen_timestamp"] else "Desconhecido"
+                        })

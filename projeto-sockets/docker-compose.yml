@@ -1,6 +1,60 @@
 services:
   # ==================================================================
-  # 1. GATEWAY INTELIGENTE (HUB COORDENADOR)
+  # 0. CACHE & MESSAGE BROKER (REDIS)
+  # ==================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - smart_city_net
+    restart: always
+
+  # ==================================================================
+  # 1.A. AGREGADOR JAVA (NETTY)
+  # ==================================================================
+  aggregator_java:
+    build:
+      context: .
+      dockerfile: aggregators/java/Dockerfile
+    container_name: aggregator_java
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - AGGREGATOR_ID=java_netty_1
+      - MULTICAST_GROUP=239.0.0.1
+      - MULTICAST_PORT=5005
+      - AES_SECRET_KEY=SmartCityKey1234
+    networks:
+      - smart_city_net
+    restart: always
+    depends_on:
+      - redis
+
+  # ==================================================================
+  # 1.B. AGREGADOR RUST (TOKIO)
+  # ==================================================================
+  aggregator_rust:
+    build:
+      context: .
+      dockerfile: aggregators/rust/Dockerfile
+    container_name: aggregator_rust
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - AGGREGATOR_ID=rust_tokio_1
+      - MULTICAST_GROUP=239.0.0.1
+      - MULTICAST_PORT=5005
+      - AES_SECRET_KEY=SmartCityKey1234
+    networks:
+      - smart_city_net
+    restart: always
+    depends_on:
+      - redis
+
+  # ==================================================================
+  # 1. GATEWAY INTELIGENTE (HUB COORDENADOR & OLAP)
   # ==================================================================
   gateway:
     build:
@@ -10,19 +64,22 @@ services:
         TARGET_SERVICE: gateway
     container_name: gateway
     ports:
-      - "5000:5000/udp"  # Ingestão de telemetria contínua
+      # UDP 5000 e 5002 foram movidos para os agregadores
       - "5001:5001/tcp"  # Interface de streaming analítico e atuação
-      - "5002:5002/udp"  # Registro de descoberta de sensores externos
-      - "5005:5005/udp"  # Canal multicast de descoberta de topologia
+      - "5007:5007/tcp"  # Interface de autenticação dos sensores
     volumes:
       - gateway_db:/app/gateway/db
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - GATEWAY_LICENSE_KEY=SMARTCITY-V1-FULL-LICENSE
+      - AES_SECRET_KEY=SmartCityKey1234
     networks:
       - smart_city_net
     restart: always
-    # asyncio cancela tasks e fecha o pool SQLite no SIGTERM —
-    # 10s garante que o WAL checkpoint final seja escrito antes do SIGKILL.
+    depends_on:
+      - redis
     stop_grace_period: 10s
     healthcheck:
       test: [
@@ -45,20 +102,20 @@ services:
         TARGET_SERVICE: sensor_clima
     container_name: sensor_clima
     environment:
-      - C_DEVICE_COUNT=6  # Número de dispositivos simulados (ajustável sem recompilação)
+      - C_DEVICE_COUNT=6
+      - SENSOR_LICENSE_PART=V1-FULL
     depends_on:
       gateway:
         condition: service_healthy
+      aggregator_java:
+        condition: service_started
+      aggregator_rust:
+        condition: service_started
     networks:
       - smart_city_net
     restart: on-failure
-    # sig_atomic_t keep_running + sigaction(SIGTERM) garantem saída limpa em < 1s.
     stop_grace_period: 5s
     healthcheck:
-      # O sensor C não expõe nenhuma porta TCP (não controlável).
-      # kill -0 verifica se PID 1 existe e está responsivo a sinais —
-      # mais robusto que inspecionar /proc/1/cmdline, que passaria para
-      # qualquer processo cujo nome contenha "sensor_c".
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
       timeout: 3s
@@ -75,18 +132,17 @@ services:
       args:
         TARGET_SERVICE: sensor_posto
     container_name: sensor_posto
+    environment:
+      - SENSOR_LICENSE_PART=V1-FULL
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
-    # posix.signal(SIGTERM) via luaposix seta keep_running=false;
-    # teardown envia STATUS_OFF e fecha sockets em < 1s.
     stop_signal: SIGTERM
     stop_grace_period: 5s
     healthcheck:
-      # CONTROL_TCP_PORT = 5006 (sensor_lua/sensor.lua)
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/5006'"]
       interval: 10s
       timeout: 3s
@@ -103,14 +159,14 @@ services:
       args:
         TARGET_SERVICE: sensor_java
     container_name: sensor_semaforo
+    environment:
+      - SENSOR_LICENSE_PART=V1-FULL
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
-    # Thread.interrupt() propaga para os loops de telemetria e TCP,
-    # encerrando ordenadamente em < 1s.
     stop_grace_period: 5s
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/5003'"]
@@ -131,13 +187,13 @@ services:
     container_name: sensor_camera
     environment:
       - PYTHONUNBUFFERED=1
+      - SENSOR_LICENSE_PART=V1-FULL
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
-    # signal.signal(SIGTERM) seta shutdown_event; threads encerram em < 1s.
     stop_grace_period: 5s
     healthcheck:
       test: [
@@ -177,6 +233,28 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+
+  # ==================================================================
+  # 7. SERVIÇO DE BACKUP ANALÍTICO (GOLANG)
+  # ==================================================================
+  backup_go:
+    build:
+      context: ./backup_go
+      dockerfile: Dockerfile
+    container_name: backup_go
+    ports:
+      - "8080:8080"
+    volumes:
+      - gateway_db:/app/gateway_db:ro
+      - ./backups:/backups
+    environment:
+      - DB_PATH=/app/gateway_db/smartcity.db
+      - BACKUP_DIR=/backups
+    networks:
+      - smart_city_net
+    restart: always
+    depends_on:
+      - gateway
 
 networks:
   smart_city_net:

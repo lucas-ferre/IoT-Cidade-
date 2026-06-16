@@ -17,13 +17,17 @@ assert(pb.loadfile("messages.pb"), "[Sensor Lua:Erro] messages.pb não encontrad
 local SECTORS = {
     { name = "Pici",         slug = "pici"         },
     { name = "Benfica",      slug = "benfica"      },
-    { name = "Porangabussu", slug = "porangabussu" }
+    { name = "Porangabussu", slug = "porangabussu" },
+    { name = "Labomar",      slug = "labomar"      }
 }
 
 local CONTROL_TCP_PORT            = 5006
 local GATEWAY_HOST                = os.getenv("GATEWAY_HOST") or "gateway"
 local GATEWAY_TELEMETRY_PORT      = 5000
 local GATEWAY_UDP_DISCOVERY_PORT  = 5002
+local AUTH_TCP_PORT               = 5007
+local SENSOR_LICENSE_PART         = os.getenv("SENSOR_LICENSE_PART") or "V1-FULL"
+local SENSOR_HEX_CODE             = "0B"
 local MULTICAST_GROUP             = "239.0.0.1"
 local MULTICAST_PORT              = 5005
 local UDP_MAX_RETRIES             = 3
@@ -58,6 +62,9 @@ local MULTICAST_BATCH_SIZE   = 8  -- datagramas multicast lidos por ciclo
 -- Fila de respostas de descoberta pendentes
 local MAX_PENDING_DISCOVERIES = 10
 
+local global_best_aggregator_ip = GATEWAY_HOST
+local global_best_aggregator_score = 999999.0
+
 local devices      = {}
 local device_order = {}
 
@@ -65,6 +72,17 @@ for idx = 1, DEVICE_COUNT do
     local sector         = SECTORS[((idx - 1) % #SECTORS) + 1]
     local sector_ordinal = math.floor((idx - 1) / #SECTORS) + 1
     local device_id      = string.format("poste_%s_%02d", sector.slug, sector_ordinal)
+
+    local cx, cy = 0, 0
+    if sector.slug == "pici" then
+        cx, cy = math.random(0, 40), math.random(0, 60)
+    elseif sector.slug == "benfica" then
+        cx, cy = math.random(50, 90), math.random(0, 30)
+    elseif sector.slug == "porangabussu" then
+        cx, cy = math.random(60, 100), math.random(50, 90)
+    else -- labomar
+        cx, cy = math.random(0, 30), math.random(70, 100)
+    end
 
     devices[device_id] = {
         device_id            = device_id,
@@ -75,7 +93,9 @@ for idx = 1, DEVICE_COUNT do
         next_jitter_secs     = math.random() * TELEMETRY_JITTER_SECS,
         next_threshold_check = 0,
         last_threshold_send  = 0,
-        manual_until         = 0
+        manual_until         = 0,
+        coord_x              = cx,
+        coord_y              = cy
     }
     table.insert(device_order, device_id)
     print(string.format("[Sensor Lua:Identidade] Nó provisionado com ID: %s | Setor: %s",
@@ -91,6 +111,17 @@ local DEFAULT_DEVICE_ID = device_order[1]
 print(string.format(
     "[sensor_posto] | [Sensor Lua:DNS] Gateway '%s' será resolvido para IP antes do envio UDP (TTL %.0fs).",
     GATEWAY_HOST, GATEWAY_DNS_CACHE_TTL_SECS))
+
+local DEVICE_IP = "127.0.0.1"
+local ip, _ = socket.dns.toip(GATEWAY_HOST)
+if ip then
+    local dummy_udp = socket.udp()
+    if dummy_udp:setpeername(ip, 5000) then
+        local local_ip = dummy_udp:getsockname()
+        if local_ip then DEVICE_IP = local_ip end
+    end
+    dummy_udp:close()
+end
 
 -- ====================================================================
 -- INICIALIZAÇÃO DE DESCRITORES DE REDE (SOCKETS POSIX BOUND)
@@ -155,8 +186,8 @@ local gateway_dns = {
 -- ====================================================================
 
 local function retry_delay(attempt)
-    local backoff = math.min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ^ (attempt - 1)))
-    return backoff + (math.random() * RETRY_BASE_DELAY)
+    local temp = math.min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ^ (attempt - 1)))
+    return math.random() * temp
 end
 
 local function discovery_probe_jitter()
@@ -364,10 +395,12 @@ local function send_discovery_response(target_device_id)
                 timestamp       = os.time(),
                 device_id       = device.device_id,
                 type            = "DEVICE_TYPE_LAMP_POST",
-                ip_address      = "sensor_posto",
+                ip_address      = DEVICE_IP,
                 control_port    = CONTROL_TCP_PORT,
                 initial_status  = device.status,
-                is_controllable = true
+                is_controllable = true,
+                coord_x         = device.coord_x,
+                coord_y         = device.coord_y
             }
             local bytes = assert(pb.encode("smartcity.DiscoveryResponse", msg))
             local ok, err = send_udp_nonblocking(bytes, GATEWAY_UDP_DISCOVERY_PORT, "Descoberta")
@@ -423,7 +456,9 @@ local function send_metrics_payload(device, trigger_reason, metrics_override)
         timestamp      = current_time,
         device_id      = device.device_id,
         current_status = device.status,
-        metrics        = metrics
+        metrics        = metrics,
+        coord_x        = device.coord_x,
+        coord_y        = device.coord_y
     }
     local bytes = assert(pb.encode("smartcity.DataPayload", payload))
     local ok, err = send_udp_nonblocking(bytes, GATEWAY_TELEMETRY_PORT, "Telemetria")
@@ -582,6 +617,20 @@ local function poll_multicast_probes(current_time)
                     "[Sensor Lua:Multicast] Fila saturada (%d/%d) — probe de %s ignorado.",
                     MAX_PENDING_DISCOVERIES, MAX_PENDING_DISCOVERIES, peer_ip))
             end
+        else
+            local ok, loadMsg = pcall(pb.decode, "smartcity.AggregatorLoad", data)
+            if ok and loadMsg and loadMsg.ip_address then
+                local score = (loadMsg.cpu_load * 0.4) + (loadMsg.queue_size * 0.6)
+                if score < global_best_aggregator_score or global_best_aggregator_ip == loadMsg.ip_address then
+                    if global_best_aggregator_ip ~= loadMsg.ip_address then
+                        print(string.format("[Sensor Lua:LoadBalancer] Rota alterada para %s (Score: %.2f -> %.2f)", loadMsg.aggregator_id, global_best_aggregator_score, score))
+                        global_best_aggregator_ip = loadMsg.ip_address
+                        GATEWAY_HOST = global_best_aggregator_ip
+                        gateway_dns.ip = nil -- Força re-resolução imediata para o novo IP
+                    end
+                    global_best_aggregator_score = score
+                end
+            end
         end
     end
 end
@@ -611,7 +660,64 @@ end
 -- KERNEL DE EVENTOS (MAIN EXECUTION ENGINE)
 -- ====================================================================
 
+local function authenticate_with_gateway()
+    print(string.format("[sensor_posto] | [Auth] Iniciando autenticacao TCP com Gateway (%s:%d)...", GATEWAY_HOST, AUTH_TCP_PORT))
+    socket.sleep(1.0)
+    
+    local auth_req = {
+        device_id = DEFAULT_DEVICE_ID,
+        type = "DEVICE_TYPE_LAMP_POST",
+        license_key_part = SENSOR_LICENSE_PART,
+        hex_service_code = SENSOR_HEX_CODE
+    }
+    local payload = assert(pb.encode("smartcity.AuthRequest", auth_req))
+    
+    local auth_client = socket.tcp()
+    auth_client:settimeout(10.0)
+    
+    local auth_ip, err = socket.dns.toip(GATEWAY_HOST)
+    if not auth_ip then
+        print("[sensor_posto] | [Auth] Falha no DNS: " .. tostring(err))
+        os.exit(1)
+    end
+    
+    local ok, conn_err = auth_client:connect(auth_ip, AUTH_TCP_PORT)
+    if not ok then
+        print("[sensor_posto] | [Auth] Erro ao conectar ao Gateway: " .. tostring(conn_err))
+        os.exit(1)
+    end
+    
+    auth_client:send(string.pack(">I4", #payload) .. payload)
+    
+    local header_data, header_err = recv_exact(auth_client, 4)
+    if not header_data then
+        print("[sensor_posto] | [Auth] Falha no cabeçalho TCP da resposta")
+        os.exit(1)
+    end
+    
+    local msg_len = string.unpack(">I4", header_data)
+    local body_data, body_err = recv_exact(auth_client, msg_len)
+    if not body_data then
+        print("[sensor_posto] | [Auth] Falha no payload TCP da resposta")
+        os.exit(1)
+    end
+    
+    local resp = assert(pb.decode("smartcity.AuthResponse", body_data))
+    if not resp.success then
+        print("[sensor_posto] | [Auth] FALHA na validacao: " .. tostring(resp.message))
+        os.exit(1)
+    end
+    
+    print(string.format("[Auth] Gateway encontrado! Tipo: sensor_posto, Chave: '%s-%s'. Validação: SUCESSO. Porta alocada e conectada: %d.", SENSOR_LICENSE_PART, SENSOR_HEX_CODE, resp.assigned_port))
+    
+    auth_client:close()
+    return resp.assigned_port
+end
+
 send_discovery_response()
+GATEWAY_TELEMETRY_PORT = authenticate_with_gateway()
+socket.sleep(2.0)
+
 local next_heartbeat_at = socket.gettime() + heartbeat_delay()
 
 while keep_running do

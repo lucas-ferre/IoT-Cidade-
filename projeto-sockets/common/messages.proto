@@ -34,6 +34,9 @@ enum QueryOp {
   OP_AVERAGE = 1;
   OP_STD_DEV = 2;
   OP_MAX_VARIATION = 3;
+  OP_ANOMALY_DETECTION = 4;
+  OP_PERCENTILE_95 = 5;
+  OP_LINEAR_TREND = 6;
 }
 
 message Metric {
@@ -46,6 +49,16 @@ message Metric {
 // PACOTES DE CAMADA UDP (INGESTÃO DE MÉTRICAS E HANDSHAKE)
 // ====================================================================
 
+message AggregatorLoad {
+  string aggregator_id = 1;
+  string ip_address = 2;
+  int32 telemetry_port = 3;
+  int32 discovery_port = 4;
+  double cpu_load = 5;
+  int32 queue_size = 6;
+  int64 timestamp = 7;
+}
+
 message DiscoveryResponse {
   string message_id = 1;      // ID único da mensagem de descoberta (UUID/Hash)
   int64 timestamp = 2;        // Instante exato do disparo (Epoch)
@@ -55,6 +68,9 @@ message DiscoveryResponse {
   int32 control_port = 6;
   DeviceStatus initial_status = 7;
   bool is_controllable = 8;
+  string aggregator_id = 9;
+  int32 coord_x = 10;
+  int32 coord_y = 11;
 }
 
 message DataPayload {
@@ -63,11 +79,26 @@ message DataPayload {
   string device_id = 3;
   DeviceStatus current_status = 4;
   repeated Metric metrics = 5;
+  int32 coord_x = 6;
+  int32 coord_y = 7;
 }
 
 // ====================================================================
 // PACOTES DE CAMADA TCP (ATUAÇÃO REMOTA E ANÁLISE OLAP)
 // ====================================================================
+
+message AuthRequest {
+  string device_id = 1;
+  DeviceType type = 2;
+  string license_key_part = 3;
+  string hex_service_code = 4;
+}
+
+message AuthResponse {
+  bool success = 1;
+  string message = 2;
+  int32 assigned_port = 3;
+}
 
 message ConfigCommand {
   string command_id = 1;      // Identificador único do frame de controle
@@ -97,6 +128,8 @@ message DeviceInfo {
   int32 control_port = 5;
   bool is_controllable = 6;
   int64 last_seen_timestamp = 7;
+  int32 coord_x = 8;
+  int32 coord_y = 9;
 }
 
 message ClientRequest {

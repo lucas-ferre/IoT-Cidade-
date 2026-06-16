@@ -24,33 +24,23 @@ Sensores heterogêneos (C, Lua, Java, Python) comunicam-se com um gateway centra
 
 ## Arquitetura
 
-O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclusivamente com o Gateway central.
+O sistema adota um modelo híbrido com **Agregadores Distribuídos de Borda** e um **Gateway Central**. Os sensores (nós da borda) realizam Autenticação via TCP diretamente com o Gateway, mas o tráfego pesado (telemetria e descoberta) é roteado para os Agregadores através de um modelo de **Descoberta Multicast de Carga (Load Balancing)**.
 
 ```
-                         Rede Compose: smart_city_net
+                          Rede Compose: smart_city_net
 ┌────────────────────────────────────────────────────────────────────┐
 │                                                                    │
-│  ┌──────────────────┐   UDP :5000 (Telemetria)                    │
+│  ┌──────────────────┐   TCP :5007 (Autenticação)                  │
 │  │  sensor_clima    │──────────────────────────────┐              │
-│  │  C · 6 Estações  │   UDP :5002 (Descoberta)     │              │
-│  │  Pici/Benf/Poran.│──────────────────────────────┤              │
+│  │  C · 6 Estações  │   UDP Dinâmica (Telemetria)  │              │
+│  │  Pici/Benf/Poran.│───────▶ Agregador Rust       │              │
 │  └──────────────────┘                              ▼              │
 │                                          ┌──────────────────────┐ │
-│  ┌──────────────────┐   UDP :5000 ──────▶│      gateway         │ │
-│  │  sensor_posto    │   UDP :5002 ──────▶│  Python / asyncio    │ │
+│  ┌──────────────────┐   TCP :5007       │      gateway         │ │
+│  │  sensor_posto    │─────────────────▶ │  Python / asyncio    │ │
 │  │  Lua · 3 Postes  │◀── TCP :5006 ──────│                      │ │
 │  └──────────────────┘                    │  SQLite WAL          │ │
 │                                          │  Pool aiosqlite      │ │
-│  ┌──────────────────┐   UDP :5000 ──────▶│  Framing TCP         │ │
-│  │  sensor_semaforo │   UDP :5002 ──────▶│                      │ │
-│  │  Java · 3 Semáf. │◀── TCP :5003 ──────│  :5000/UDP ingestão  │ │
-│  └──────────────────┘                    │  :5002/UDP descoberta│ │
-│                                          │  :5001/TCP cliente   │ │
-│  ┌──────────────────┐   UDP :5000 ──────▶└──────────────────────┘ │
-│  │  sensor_camera   │   UDP :5002 ──────▶          ▲              │
-│  │  Python · 3 Câm. │◀── TCP :5004 ──────          │ TCP :5001    │
-│  └──────────────────┘                    ┌──────────────────────┐ │
-│                                          │     dashboard        │ │
 │  ←── Multicast 239.0.0.1 ────────────────│  Streamlit :8501     │ │
 │       Recovery Probes (UDP :5005)        └──────────────────────┘ │
 └────────────────────────────────────────────────────────────────────┘
@@ -63,11 +53,13 @@ O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclu
 
 | Fase | Protocolo | Descrição |
 |------|-----------|-----------|
-| **Registro** | UDP :5002 | Sensor envia `DiscoveryResponse` → Gateway persiste dispositivo no SQLite |
-| **Telemetria** | UDP :5000 | Sensor envia `DataPayload` com métricas → Gateway valida, desduplicando e persiste |
+| **Descoberta Agregador** | UDP :5005 | Sensores escutam Multicast `AggregatorLoad` para escolher o melhor agregador |
+| **Registro/Discovery** | UDP :5002 | Sensor envia `DiscoveryResponse` para o Agregador selecionado → Redis `discovery_stream` → Gateway persiste no SQLite |
+| **Autenticação** | TCP :5007 | Sensor envia Chave de Licença e Hexadecimal → Gateway aloca porta UDP via Redis PubSub |
+| **Telemetria** | UDP Dinâmica | Sensor envia `DataPayload` para a porta alocada no Agregador → Redis `telemetry_stream` → Gateway persiste no SQLite |
 | **Controle** | TCP :500x | Dashboard envia `ConfigCommand` via Gateway → Gateway faz proxy para sensor alvo |
 | **Analítica** | TCP :5001 | Dashboard requisita agregação OLAP → Gateway processa e retorna escalar |
-| **Recuperação** | Multicast | Gateway transmite probe → Sensores re-enviam `DiscoveryResponse` |
+| **Desligamento** | Interno | Gateway detecta inatividade → Publica `FECHAR_PORTA_UDP` → Agregadores encerram socket e liberam recurso |
 
 ---
 
@@ -75,15 +67,17 @@ O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclu
 
 | Componente | Linguagem | Runtime | Biblioteca principal |
 |-----------|-----------|---------|---------------------|
-| Gateway | Python 3.11 | asyncio | `aiosqlite`, `protobuf` |
+| Gateway | Python 3.11 | asyncio | `aiosqlite`, `redis` |
+| Agregador Java | Java 21 | JVM | `netty`, `jedis` |
+| Agregador Rust | Rust | Tokio | `tokio`, `redis-rs` |
 | Dashboard | Python 3.11 | Streamlit | `protobuf`, `pandas` |
 | Sensor Clima | C (C11) | POSIX/pthreads | `protobuf-c` |
 | Sensor Poste | Lua 5.4 | LuaSocket | `lua-protobuf`, `luaposix` |
 | Sensor Semáforo | Java 21 | JVM | `protobuf-java` |
 | Sensor Câmera | Python 3.11 | threading | `protobuf` |
-| Serialização | — | — | Protocol Buffers 3 |
-| Persistência | — | — | SQLite 3 (WAL mode) |
-| Orquestração | — | Docker Compose ou Podman Compose | — |
+| Message Broker | — | Redis 7 | Pub/Sub, Streams |
+| Persistência | — | SQLite | SQLite 3 (WAL mode) |
+| Criptografia | — | AES-128 GCM | Criptografia na telemetria entre Agregadores e Gateway |
 
 ---
 
@@ -183,11 +177,11 @@ podman exec gateway sqlite3 db/smartcity_gateway.db \
 
 | Serviço | Porta | Protocolo | Descrição |
 |---------|-------|-----------|-----------|
-| `gateway` | **5000** | UDP | Ingestão de telemetria contínua |
-| `gateway` | **5001** | TCP | Interface cliente (dashboard) |
-| `gateway` | **5002** | UDP | Registro de handshakes de descoberta |
-| `gateway` | **5005** | UDP | Grupo multicast 239.0.0.1 — probes de topologia |
+| `gateway` | **5001** | TCP | Interface analítica e cliente (dashboard) |
+| `gateway` | **5007** | TCP | Interface de autenticação dos sensores |
 | `dashboard` | **8501** | TCP/HTTP | Interface web Streamlit |
+
+> As portas **5000**, **5002** e as **portas UDP dinâmicas** agora são gerenciadas e expostas pelos Agregadores Java e Rust na rede interna do Docker, não sendo publicadas diretamente ao host, promovendo resiliência e isolamento arquitetural.
 
 ### Internas (rede Compose)
 
@@ -331,9 +325,12 @@ Mensagens principais:
 
 | Mensagem | Direção | Canal |
 |----------|---------|-------|
-| `DiscoveryResponse` | Sensor → Gateway | UDP :5002 (boot, heartbeat e recovery) |
-| `DataPayload` | Sensor → Gateway | UDP :5000 |
-| `ConfigCommand` | Gateway → Sensor | TCP :500x |
+| `AggregatorLoad` | Agregador → Sensor | UDP Multicast :5005 |
+| `AuthRequest` | Sensor → Gateway | TCP :5007 (Autenticação/Licença) |
+| `AuthResponse` | Gateway → Sensor | TCP :5007 (Atribuição de Porta UDP) |
+| `DiscoveryResponse`| Sensor → Agregador | UDP :5002 |
+| `DataPayload` | Sensor → Agregador | UDP Dinâmica (Porta Atribuída) |
+| `ConfigCommand` | Gateway → Sensor | TCP :500x (Atuação) |
 | `ConfigResponse` | Sensor → Gateway | TCP :500x |
 | `ClientRequest` | Dashboard → Gateway | TCP :5001 |
 | `ClientResponse` | Gateway → Dashboard | TCP :5001 |
