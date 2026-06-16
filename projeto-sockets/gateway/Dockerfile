@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Instalação das bibliotecas Python de runtime (incluindo aiosqlite)
-RUN pip install --no-cache-dir protobuf aiosqlite redis
+RUN pip install --no-cache-dir protobuf aiosqlite redis cryptography
 
 # Injeção do código do serviço e do contrato de dados centralizado
 COPY ./gateway ./gateway

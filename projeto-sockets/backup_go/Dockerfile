@@ -4,10 +4,8 @@ FROM golang:1.20-alpine AS builder
 RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /app
-COPY go.mod ./
-RUN go mod download
-
 COPY . .
+RUN go mod tidy
 # CGO_ENABLED=1 é obrigatório para github.com/mattn/go-sqlite3
 RUN CGO_ENABLED=1 GOOS=linux go build -a -o backup_go main.go
 
