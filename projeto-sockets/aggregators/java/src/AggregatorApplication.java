@@ -304,10 +304,10 @@ public class AggregatorApplication {
                         } else if (payload.startsWith("FECHAR_PORTA_UDP: ")) {
                             try {
                                 int port = Integer.parseInt(payload.substring(18).trim());
-                                io.netty.channel.Channel channel = activePorts.remove(port);
-                                if (channel != null) {
+                                io.netty.channel.Channel nettyChannel = activePorts.remove(port);
+                                if (nettyChannel != null) {
                                     System.out.println("Comando recebido: fechando porta UDP " + port);
-                                    channel.close().sync();
+                                    nettyChannel.close().sync();
                                 }
                             } catch (Exception e) {
                                 System.err.println("Erro ao fechar porta: " + e.getMessage());
