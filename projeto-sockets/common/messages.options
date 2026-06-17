@@ -11,3 +11,9 @@ smartcity.DataPayload.metrics max_count:6
 
 smartcity.Metric.name max_size:16
 smartcity.Metric.unit max_size:16
+
+smartcity.AuthRequest.device_id max_size:32
+smartcity.AuthRequest.license_key_part max_size:64
+smartcity.AuthRequest.hex_service_code max_size:8
+
+smartcity.AuthResponse.message max_size:128

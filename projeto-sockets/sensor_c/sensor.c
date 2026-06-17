@@ -18,6 +18,7 @@
 /* Substituímos protobuf-c por nanopb */
 #include "messages.pb.h"
 #include <pb_encode.h>
+#include <pb_decode.h>
 
 #define GATEWAY_HOST           "gateway"
 char GATEWAY_TELEMETRY_PORT[16] = "5000";
