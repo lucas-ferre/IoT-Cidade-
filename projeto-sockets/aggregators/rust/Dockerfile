@@ -1,4 +1,4 @@
-FROM rust:1.76-bookworm AS builder
+FROM rust:bookworm AS builder
 
 WORKDIR /usr/src/app
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
