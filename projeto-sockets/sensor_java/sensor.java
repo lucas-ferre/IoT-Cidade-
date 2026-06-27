@@ -75,6 +75,9 @@ public class sensor {
         System.getenv().getOrDefault("TRAFFIC_QUEUE_THRESHOLD", "35")
     );
 
+    // Guarda anti-replay compartilhada por todas as conexões de controle.
+    private static final ControlCrypto.ReplayGuard REPLAY_GUARD = new ControlCrypto.ReplayGuard();
+
     private static class DeviceState {
         final String deviceId;
         final String sector;
@@ -148,20 +151,35 @@ public class sensor {
         }
         System.out.println("============================================================");
 
-        // 1. Injeção do Handshake inicial na rede de descoberta
+        // 1. Alocação da Thread de Recuperação via canal Multicast
+        new Thread(sensor::startMulticastListener).start();
+
+        System.out.println("[Java] Aguardando broadcast de AggregatorLoad para descobrir IP real...");
+        String initialGateway = System.getenv().getOrDefault("GATEWAY_HOST", "gateway");
+        while (GATEWAY_HOST.equals("gateway") || GATEWAY_HOST.equals(initialGateway)) {
+            try { Thread.sleep(100); } catch (Exception e) {}
+        }
+
+        // 2. Injeção do Handshake inicial na rede de descoberta
         sendDiscovery();
 
         GATEWAY_TELEMETRY_PORT = authenticateWithGateway();
         try { Thread.sleep(2000); } catch (Exception e) {}
 
-        // 2. Alocação da Thread de Controle TCP (Atuação remota)
+        // 3. Alocação da Thread de Controle TCP (Atuação remota)
         new Thread(sensor::startTcpServer).start();
-
-        // 3. Alocação da Thread de Recuperação via canal Multicast
-        new Thread(sensor::startMulticastListener).start();
 
         // 4. Renovação periódica explícita de presença no Gateway
         new Thread(sensor::startHeartbeatLoop).start();
+
+        // 4.5 Console IDLE embutido (opt-in via SENSOR_IDLE_CONSOLE). Conecta-se ao
+        // próprio servidor de controle local; requer terminal anexado (stdin_open + tty).
+        if (idleConsoleEnabled()) {
+            Thread idle = new Thread(() -> Console.runConsole("127.0.0.1", CONTROL_TCP_PORT));
+            idle.setDaemon(true);
+            idle.start();
+            System.out.println("[Java:IDLE] Console embutido ativo (use 'docker attach').");
+        }
 
         // 5. Bloqueio da Thread Principal no Loop de Telemetria UDP
         runTelemetryLoop();
@@ -170,6 +188,11 @@ public class sensor {
     // ====================================================================
     // ROTINAS DE PROTOCOLO E COMUNICAÇÃO
     // ====================================================================
+
+    private static boolean idleConsoleEnabled() {
+        String raw = System.getenv().getOrDefault("SENSOR_IDLE_CONSOLE", "").trim().toLowerCase();
+        return raw.equals("1") || raw.equals("true") || raw.equals("yes") || raw.equals("on");
+    }
 
     private static long retryDelayMillis(int attempt) {
         long temp = RETRY_BASE_DELAY_MS;
@@ -387,6 +410,13 @@ public class sensor {
         }
     }
 
+    /** Escreve um frame de resposta, cifrando-o quando CONTROL_SECURE=1. */
+    private static void writeFrame(DataOutputStream out, byte[] msg) throws Exception {
+        byte[] frame = ControlCrypto.SECURE ? ControlCrypto.wrap(msg) : msg;
+        out.writeInt(frame.length);
+        out.write(frame);
+    }
+
     /** Instancia o servidor TCP implementando Length-Prefix Framing */
     private static void startTcpServer() {
         try (ServerSocket server = new ServerSocket(CONTROL_TCP_PORT)) {
@@ -405,9 +435,27 @@ public class sensor {
                     byte[] payload = new byte[len];
                     in.readFully(payload);
 
+                    if (ControlCrypto.SECURE) {
+                        payload = ControlCrypto.unwrap(payload);
+                    }
+
                     // Desserialização segura a partir do tamanho extraído
                     Messages.ConfigCommand cmd = Messages.ConfigCommand.parseFrom(payload);
                     System.out.println("[Java:TCP] Comando interceptado. ID: " + cmd.getCommandId());
+
+                    if (ControlCrypto.SECURE) {
+                        String reject = REPLAY_GUARD.check(cmd.getCommandId(), cmd.getTimestamp());
+                        if (reject != null) {
+                            System.err.println("[Java:TCP] Comando rejeitado (anti-replay): " + reject);
+                            Messages.ConfigResponse rej = Messages.ConfigResponse.newBuilder()
+                                .setCommandId(cmd.getCommandId())
+                                .setSuccess(false)
+                                .setMessage("Comando rejeitado (anti-replay): " + reject)
+                                .build();
+                            writeFrame(out, rej.toByteArray());
+                            continue;
+                        }
+                    }
 
                     // Mutações de estado em memória volátil
                     String targetDeviceId = cmd.getTargetDeviceId().isBlank()
@@ -421,9 +469,7 @@ public class sensor {
                             .setMessage("Dispositivo alvo desconhecido no semáforo Java.")
                             .build();
 
-                        byte[] respBuf = resp.toByteArray();
-                        out.writeInt(respBuf.length);
-                        out.write(respBuf);
+                        writeFrame(out, resp.toByteArray());
                         continue;
                     }
 
@@ -457,11 +503,8 @@ public class sensor {
                         .setUpdatedFrequencySecs(target.frequencySecs)
                         .build();
 
-                    byte[] respBuf = resp.toByteArray();
-
-                    // Aplicação do Framing na resposta: [Prefixo Int32] + [Vetor Binário]
-                    out.writeInt(respBuf.length);
-                    out.write(respBuf);
+                    // Aplicação do Framing na resposta (cifrada se CONTROL_SECURE)
+                    writeFrame(out, resp.toByteArray());
                     sendDiscovery(target.deviceId);
                 } catch (Exception e) {
                     // SocketException("interrupted") é a forma como operações de socket
@@ -511,29 +554,29 @@ public class sensor {
                 DatagramPacket p = new DatagramPacket(buf, buf.length);
                 mc.receive(p);
 
-                String probeData = new String(p.getData(), 0, p.getLength());
-                if (probeData.equals("SMARTCITY_DISCOVERY_PROBE")) {
-                    System.out.println("[Java:Multicast] Probe de recuperação detectado. Re-sincronizando topologia com jitter!");
-                    if (!waitDiscoveryProbeJitter()) {
-                        continue;
-                    }
-                    sendDiscovery();
-                } else {
-                    try {
-                        byte[] pureData = new byte[p.getLength()];
-                        System.arraycopy(p.getData(), 0, pureData, 0, p.getLength());
-                        Messages.AggregatorLoad loadMsg = Messages.AggregatorLoad.parseFrom(pureData);
-                        if (loadMsg != null && !loadMsg.getIpAddress().isEmpty()) {
-                            double score = (loadMsg.getCpuLoad() * 0.4) + (loadMsg.getQueueSize() * 0.6);
-                            if (score < BEST_AGGREGATOR_SCORE || GATEWAY_HOST.equals(loadMsg.getIpAddress())) {
-                                if (!GATEWAY_HOST.equals(loadMsg.getIpAddress())) {
-                                    System.out.printf(java.util.Locale.US, "[Sensor Java:LoadBalancer] Rota alterada para %s (Score: %.2f -> %.2f)\n", loadMsg.getAggregatorId(), BEST_AGGREGATOR_SCORE, score);
-                                    GATEWAY_HOST = loadMsg.getIpAddress();
-                                }
-                                BEST_AGGREGATOR_SCORE = score;
-                            }
+                try {
+                    byte[] pureData = new byte[p.getLength()];
+                    System.arraycopy(p.getData(), 0, pureData, 0, p.getLength());
+                    Messages.AggregatorLoad loadMsg = Messages.AggregatorLoad.parseFrom(pureData);
+                    
+                    if (loadMsg != null && "GATEWAY_PROBE".equals(loadMsg.getAggregatorId())) {
+                        System.out.println("[Java:Multicast] Probe de recuperação detectado. Re-sincronizando topologia com jitter!");
+                        if (!waitDiscoveryProbeJitter()) {
+                            continue;
                         }
-                    } catch (Exception ignored) {}
+                        sendDiscovery();
+                    } else if (loadMsg != null && !loadMsg.getIpAddress().isEmpty()) {
+                        double score = (loadMsg.getCpuLoad() * 0.4) + (loadMsg.getQueueSize() * 0.6);
+                        if (score < BEST_AGGREGATOR_SCORE || GATEWAY_HOST.equals(loadMsg.getIpAddress())) {
+                            if (!GATEWAY_HOST.equals(loadMsg.getIpAddress())) {
+                                System.out.printf(java.util.Locale.US, "[Sensor Java:LoadBalancer] Rota alterada para %s (Score: %.2f -> %.2f)\n", loadMsg.getAggregatorId(), BEST_AGGREGATOR_SCORE, score);
+                                GATEWAY_HOST = loadMsg.getIpAddress();
+                            }
+                            BEST_AGGREGATOR_SCORE = score;
+                        }
+                    }
+                } catch (Exception ex) {
+                    // Ignora pacotes corrompidos
                 }
             }
         } catch (Exception e) {

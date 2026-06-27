@@ -1,5 +1,9 @@
 local socket = require("socket")
 local pb     = require("pb")
+local control_crypto = require("control_crypto")
+
+-- Guarda anti-replay compartilhada pelas conexões de controle.
+local replay_guard = control_crypto.new_replay_guard()
 
 print("============================================================")
 print("[Sensor Lua] Inicializando Poste Inteligente (Arquitetura Multiplexada)...")
@@ -501,6 +505,11 @@ local function poll_threshold_events(current_time)
     end
 end
 
+local function send_control_frame(client, bytes)
+    if control_crypto.SECURE then bytes = control_crypto.wrap(bytes) end
+    client:send(string.pack(">I4", #bytes) .. bytes)
+end
+
 local function handle_control_command(client)
     local peer_ip, peer_port = client:getpeername()
     print(string.format("[Sensor Lua:TCP] Conexão estabelecida com %s:%s", peer_ip, peer_port))
@@ -529,6 +538,16 @@ local function handle_control_command(client)
         return
     end
 
+    if control_crypto.SECURE then
+        local ok_dec, plain = pcall(control_crypto.unwrap, body_data)
+        if not ok_dec then
+            print("[Sensor Lua:Erro] Falha ao decifrar frame de controle: " .. tostring(plain))
+            client:close()
+            return
+        end
+        body_data = plain
+    end
+
     local decode_ok, cmd = pcall(pb.decode, "smartcity.ConfigCommand", body_data)
     if not decode_ok or not cmd then
         print("[Sensor Lua:Erro] Corrupção na desserialização do payload de atuação Protobuf.")
@@ -537,6 +556,20 @@ local function handle_control_command(client)
     end
 
     print(string.format("[Sensor Lua:Controle] Frame ID '%s' desserializado.", cmd.command_id))
+
+    if control_crypto.SECURE then
+        local ok_rp, reason = replay_guard:check(cmd.command_id, cmd.timestamp)
+        if not ok_rp then
+            print("[Sensor Lua:Erro] Comando rejeitado (anti-replay): " .. tostring(reason))
+            local rej = assert(pb.encode("smartcity.ConfigResponse", {
+                command_id = cmd.command_id, success = false,
+                message    = "Comando rejeitado (anti-replay): " .. tostring(reason)
+            }))
+            send_control_frame(client, rej)
+            client:close()
+            return
+        end
+    end
 
     local target_device_id = (cmd.target_device_id and cmd.target_device_id ~= "")
                              and cmd.target_device_id or DEFAULT_DEVICE_ID
@@ -548,7 +581,7 @@ local function handle_control_command(client)
             command_id = cmd.command_id, success = false,
             message    = "Dispositivo alvo desconhecido no atuador Lua."
         }))
-        client:send(string.pack(">I4", #resp_bytes) .. resp_bytes)
+        send_control_frame(client, resp_bytes)
         client:close()
         return
     end
@@ -573,7 +606,7 @@ local function handle_control_command(client)
         updated_status         = target.status,
         updated_frequency_secs = target.frequency_secs
     }))
-    client:send(string.pack(">I4", #resp_bytes) .. resp_bytes)
+    send_control_frame(client, resp_bytes)
     send_discovery_response(target.device_id)
     client:close()
 end
@@ -604,29 +637,27 @@ local function poll_multicast_probes(current_time)
         if not data then break end
         received = received + 1
 
-        if data == "SMARTCITY_DISCOVERY_PROBE" then
-            if queue_size(pending_discoveries) < MAX_PENDING_DISCOVERIES then
-                local delay = discovery_probe_jitter()
-                enqueue(pending_discoveries, { fire_at = current_time + delay })
-                print(string.format(
-                    "[Sensor Lua:Multicast] Probe de %s → descoberta agendada em %.0fms (fila: %d/%d).",
-                    peer_ip, delay * 1000,
-                    queue_size(pending_discoveries), MAX_PENDING_DISCOVERIES))
-            else
-                print(string.format(
-                    "[Sensor Lua:Multicast] Fila saturada (%d/%d) — probe de %s ignorado.",
-                    MAX_PENDING_DISCOVERIES, MAX_PENDING_DISCOVERIES, peer_ip))
-            end
-        else
-            local ok, loadMsg = pcall(pb.decode, "smartcity.AggregatorLoad", data)
-            if ok and loadMsg and loadMsg.ip_address then
+        local ok, loadMsg = pcall(pb.decode, "smartcity.AggregatorLoad", data)
+        if ok and loadMsg then
+            if loadMsg.aggregator_id == "GATEWAY_PROBE" then
+                if queue_size(pending_discoveries) < MAX_PENDING_DISCOVERIES then
+                    local delay = discovery_probe_jitter()
+                    enqueue(pending_discoveries, { fire_at = current_time + delay })
+                    print(string.format(
+                        "[Sensor Lua:Multicast] Probe de %s → descoberta agendada em %.0fms (fila: %d/%d).",
+                        peer_ip, delay * 1000,
+                        queue_size(pending_discoveries), MAX_PENDING_DISCOVERIES))
+                else
+                    print(string.format(
+                        "[Sensor Lua:Multicast] Fila saturada (%d/%d) — probe de %s ignorado.",
+                        MAX_PENDING_DISCOVERIES, MAX_PENDING_DISCOVERIES, peer_ip))
+                end
+            elseif loadMsg.ip_address then
                 local score = (loadMsg.cpu_load * 0.4) + (loadMsg.queue_size * 0.6)
                 if score < global_best_aggregator_score or global_best_aggregator_ip == loadMsg.ip_address then
                     if global_best_aggregator_ip ~= loadMsg.ip_address then
                         print(string.format("[Sensor Lua:LoadBalancer] Rota alterada para %s (Score: %.2f -> %.2f)", loadMsg.aggregator_id, global_best_aggregator_score, score))
                         global_best_aggregator_ip = loadMsg.ip_address
-                        GATEWAY_HOST = global_best_aggregator_ip
-                        gateway_dns.ip = nil -- Força re-resolução imediata para o novo IP
                     end
                     global_best_aggregator_score = score
                 end
@@ -714,9 +745,42 @@ local function authenticate_with_gateway()
     return resp.assigned_port
 end
 
+local INITIAL_GATEWAY_HOST = GATEWAY_HOST
+print("[Sensor Lua] Aguardando broadcast de AggregatorLoad para descobrir IP real...")
+while global_best_aggregator_ip == INITIAL_GATEWAY_HOST and keep_running do
+    poll_multicast_probes(socket.gettime())
+    socket.sleep(0.1)
+end
+
+if not keep_running then
+    os.exit(0)
+end
+
 send_discovery_response()
 GATEWAY_TELEMETRY_PORT = authenticate_with_gateway()
 socket.sleep(2.0)
+
+-- Console IDLE embutido (opt-in via SENSOR_IDLE_CONSOLE). Mono-thread: o poll de
+-- stdin é não-bloqueante e roda dentro do loop principal (ver console.lua).
+local console = nil
+do
+    local idle = string.lower(os.getenv("SENSOR_IDLE_CONSOLE") or "")
+    if idle == "1" or idle == "true" or idle == "yes" or idle == "on" then
+        local ok_req, mod = pcall(require, "console")
+        if ok_req and mod then
+            console = mod
+            console.init({
+                devices              = devices,
+                device_order         = device_order,
+                default_device_id    = DEFAULT_DEVICE_ID,
+                socket               = socket,
+                manual_override_secs = MANUAL_OVERRIDE_SECS,
+            })
+        else
+            print("[Sensor Lua:IDLE] Falha ao carregar console.lua: " .. tostring(mod))
+        end
+    end
+end
 
 local next_heartbeat_at = socket.gettime() + heartbeat_delay()
 
@@ -758,6 +822,9 @@ while keep_running do
 
     -- 6. Drenagem do buffer multicast + fila de descobertas pendentes
     poll_multicast_probes(current_time)
+
+    -- 6.5 Console IDLE embutido (poll não-bloqueante de stdin)
+    if console then console.poll() end
 
     -- 7. Cessão de ciclos ao kernel host
     socket.sleep(0.1 + (math.random() * TELEMETRY_JITTER_SECS / 10))

@@ -1,0 +1,14 @@
+{
+  "name": "sensor-enchente",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sensor de enchente / nivel d'agua (Node.js) para a plataforma Smart City",
+  "main": "sensor.js",
+  "scripts": {
+    "start": "node sensor.js",
+    "console": "node console.js"
+  },
+  "dependencies": {
+    "protobufjs": "^7.2.6"
+  }
+}

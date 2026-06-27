@@ -67,6 +67,7 @@ services:
       # UDP 5000 e 5002 foram movidos para os agregadores
       - "5001:5001/tcp"  # Interface de streaming analítico e atuação
       - "5007:5007/tcp"  # Interface de autenticação dos sensores
+      - "9100:9100/tcp"  # Endpoint de métricas Prometheus (/metrics) — Fase E
     volumes:
       - gateway_db:/app/gateway/db
     environment:
@@ -75,6 +76,9 @@ services:
       - REDIS_PORT=6379
       - GATEWAY_LICENSE_KEY=SMARTCITY-V1-FULL-LICENSE
       - AES_SECRET_KEY=SmartCityKey1234
+      # Cifra+anti-replay do canal de controle. Só ligar (=1) quando TODOS os
+      # sensores controláveis (câmera/semáforo/poste) já suportarem o modo seguro.
+      - CONTROL_SECURE=0
     networks:
       - smart_city_net
     restart: always
@@ -104,6 +108,10 @@ services:
     environment:
       - C_DEVICE_COUNT=6
       - SENSOR_LICENSE_PART=V1-FULL
+      # =1 + 'docker attach sensor_clima' para o console IDLE de status embutido
+      - SENSOR_IDLE_CONSOLE=0
+    stdin_open: true
+    tty: true
     depends_on:
       gateway:
         condition: service_healthy
@@ -134,6 +142,13 @@ services:
     container_name: sensor_posto
     environment:
       - SENSOR_LICENSE_PART=V1-FULL
+      # =1 + 'docker attach sensor_posto' para o console IDLE embutido (requer luaposix)
+      - SENSOR_IDLE_CONSOLE=0
+      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
+      - AES_SECRET_KEY=SmartCityKey1234
+      - CONTROL_SECURE=0
+    stdin_open: true
+    tty: true
     depends_on:
       gateway:
         condition: service_healthy
@@ -161,6 +176,13 @@ services:
     container_name: sensor_semaforo
     environment:
       - SENSOR_LICENSE_PART=V1-FULL
+      # =1 + 'docker attach sensor_semaforo' para o console IDLE embutido
+      - SENSOR_IDLE_CONSOLE=0
+      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
+      - AES_SECRET_KEY=SmartCityKey1234
+      - CONTROL_SECURE=0
+    stdin_open: true
+    tty: true
     depends_on:
       gateway:
         condition: service_healthy
@@ -188,6 +210,13 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - SENSOR_LICENSE_PART=V1-FULL
+      # =1 + 'docker attach sensor_camera' para o console IDLE embutido
+      - SENSOR_IDLE_CONSOLE=0
+      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
+      - AES_SECRET_KEY=SmartCityKey1234
+      - CONTROL_SECURE=0
+    stdin_open: true
+    tty: true
     depends_on:
       gateway:
         condition: service_healthy
@@ -206,6 +235,84 @@ services:
       start_period: 5s
 
   # ==================================================================
+  # 5.B. SENSOR DE ENCHENTE / NÍVEL D'ÁGUA (NÓ NODE.JS - CONTROLÁVEL)
+  # ==================================================================
+  sensor_enchente:
+    build:
+      context: .
+      dockerfile: sensor_node/Dockerfile
+    container_name: sensor_enchente
+    environment:
+      - SENSOR_LICENSE_PART=V1-FULL
+      - FLOOD_DEVICE_COUNT=4
+      # =1 + 'docker attach sensor_enchente' para o console IDLE embutido
+      - SENSOR_IDLE_CONSOLE=0
+      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
+      - AES_SECRET_KEY=SmartCityKey1234
+      - CONTROL_SECURE=0
+    stdin_open: true
+    tty: true
+    depends_on:
+      gateway:
+        condition: service_healthy
+      aggregator_java:
+        condition: service_started
+      aggregator_rust:
+        condition: service_started
+    networks:
+      - smart_city_net
+    restart: on-failure
+    stop_grace_period: 5s
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "node -e 'require(\"net\").connect(5010,\"127.0.0.1\").on(\"connect\",()=>process.exit(0)).on(\"error\",()=>process.exit(1))' || exit 1"
+      ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # ==================================================================
+  # 5.C. SENSOR DE RUÍDO AMBIENTE (NÓ RUBY - CONTROLÁVEL)
+  # ==================================================================
+  sensor_ruido:
+    build:
+      context: .
+      dockerfile: sensor_ruby/Dockerfile
+    container_name: sensor_ruido
+    environment:
+      - SENSOR_LICENSE_PART=V1-FULL
+      - NOISE_DEVICE_COUNT=4
+      # =1 + 'docker attach sensor_ruido' para o console IDLE embutido
+      - SENSOR_IDLE_CONSOLE=0
+      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
+      - AES_SECRET_KEY=SmartCityKey1234
+      - CONTROL_SECURE=0
+    stdin_open: true
+    tty: true
+    depends_on:
+      gateway:
+        condition: service_healthy
+      aggregator_java:
+        condition: service_started
+      aggregator_rust:
+        condition: service_started
+    networks:
+      - smart_city_net
+    restart: on-failure
+    stop_grace_period: 5s
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "ruby -e 'require \"socket\"; TCPSocket.new(\"127.0.0.1\", 5011).close' || exit 1"
+      ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # ==================================================================
   # 6. CLIENTE ANALÍTICO (DASHBOARD STREAMLIT)
   # ==================================================================
   dashboard:
@@ -217,9 +324,17 @@ services:
     container_name: dashboard
     ports:
       - "8501:8501"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Login do dashboard. Para tirar do texto puro, use DASHBOARD_PASSWORD_FILE
+      # (Docker secret) — ver docker-compose.secrets.yml. Vazio = acesso aberto.
+      - DASHBOARD_PASSWORD=smartcity
     depends_on:
       gateway:
         condition: service_healthy
+      redis:
+        condition: service_started
     networks:
       - smart_city_net
     restart: on-failure
@@ -248,8 +363,46 @@ services:
       - gateway_db:/app/gateway_db:ro
       - ./backups:/backups
     environment:
-      - DB_PATH=/app/gateway_db/smartcity.db
+      - DB_PATH=/app/gateway_db/smartcity_gateway.db
       - BACKUP_DIR=/backups
+    networks:
+      - smart_city_net
+    restart: always
+    depends_on:
+      - gateway
+
+  # ==================================================================
+  # 8. ALEXA VOICE INTEGRATION (ASK-SDK)
+  # ==================================================================
+  alexa_skill:
+    build:
+      context: .
+      dockerfile: alexa_skill/Dockerfile
+    container_name: alexa_skill
+    ports:
+      - "5008:5008"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      gateway:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - smart_city_net
+    restart: on-failure
+
+  # ==================================================================
+  # 9. OBSERVABILIDADE — PROMETHEUS (raspa /metrics do Gateway) — Fase E
+  # ==================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     networks:
       - smart_city_net
     restart: always

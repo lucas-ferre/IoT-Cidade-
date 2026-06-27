@@ -27,7 +27,7 @@ COPY ./common/messages.options .
 
 # 4. Compila dinamicamente o .proto para C usando o nanopb e gera o binário final
 RUN protoc --plugin=protoc-gen-nanopb=/opt/nanopb/generator/protoc-gen-nanopb --nanopb_out=. messages.proto
-RUN gcc -o sensor_c sensor.c messages.pb.c /opt/nanopb/pb_encode.c /opt/nanopb/pb_decode.c /opt/nanopb/pb_common.c -I/opt/nanopb -I. -lpthread
+RUN gcc -o sensor_c sensor.c console.c messages.pb.c /opt/nanopb/pb_encode.c /opt/nanopb/pb_decode.c /opt/nanopb/pb_common.c -I/opt/nanopb -I. -lpthread
 
 # 5. Define o ponto de entrada
 CMD ["./sensor_c"]

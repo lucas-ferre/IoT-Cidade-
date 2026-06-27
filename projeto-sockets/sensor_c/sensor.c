@@ -539,14 +539,14 @@ void *multicast_listener_thread(void *arg) {
         }
         if (n > 0) {
             buffer[n] = '\0';
-            if (strcmp(buffer, "SMARTCITY_DISCOVERY_PROBE") == 0) {
-                printf("[Sensor C:Thread] Probe interceptado — re-sincronizando topologia com jitter.\n");
-                wait_discovery_probe_jitter();
-                send_discovery_announcement();
-            } else {
-                smartcity_AggregatorLoad loadMsg = smartcity_AggregatorLoad_init_zero;
-                pb_istream_t stream = pb_istream_from_buffer((uint8_t*)buffer, n);
-                if (pb_decode(&stream, smartcity_AggregatorLoad_fields, &loadMsg)) {
+            smartcity_AggregatorLoad loadMsg = smartcity_AggregatorLoad_init_zero;
+            pb_istream_t stream = pb_istream_from_buffer((uint8_t*)buffer, n);
+            if (pb_decode(&stream, smartcity_AggregatorLoad_fields, &loadMsg)) {
+                if (strcmp(loadMsg.aggregator_id, "GATEWAY_PROBE") == 0) {
+                    printf("[Sensor C:Thread] Probe interceptado — re-sincronizando topologia com jitter.\n");
+                    wait_discovery_probe_jitter();
+                    send_discovery_announcement();
+                } else {
                     double score = (loadMsg.cpu_load * 0.4) + (loadMsg.queue_size * 0.6);
                     
                     pthread_mutex_lock(&router_mutex);
@@ -756,6 +756,36 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
+    /* Thread de escuta Multicast — g_self_hostname é read-only a partir daqui */
+    if (pthread_create(&listener_tid, NULL, multicast_listener_thread, NULL) != 0)
+        perror("[Sensor C:Aviso] Falha ao criar thread Multicast");
+
+    /* Console IDLE de status embutido (opt-in via SENSOR_IDLE_CONSOLE).
+     * Somente leitura — a estação de clima é não-controlável por projeto. */
+    {
+        const char *idle_env = getenv("SENSOR_IDLE_CONSOLE");
+        if (idle_env && (strcmp(idle_env, "1") == 0 || strcmp(idle_env, "true") == 0 ||
+                         strcmp(idle_env, "yes") == 0 || strcmp(idle_env, "on") == 0)) {
+            extern void *console_idle_thread(void *);
+            pthread_t console_tid;
+            if (pthread_create(&console_tid, NULL, console_idle_thread, NULL) == 0) {
+                pthread_detach(console_tid);
+                printf("[Sensor C:IDLE] Console de status embutido ativo (use 'docker attach').\n");
+            } else {
+                fprintf(stderr, "[Sensor C:IDLE] Falha ao criar thread do console.\n");
+            }
+        }
+    }
+
+    printf("[Sensor C] Aguardando broadcast de AggregatorLoad para descobrir IP real...\n");
+    while (keep_running) {
+        pthread_mutex_lock(&router_mutex);
+        int is_default = (strcmp(global_best_aggregator_ip, GATEWAY_HOST) == 0);
+        pthread_mutex_unlock(&router_mutex);
+        if (!is_default) break;
+        usleep(100000);
+    }
+
     /* Handshake topológico inicial — g_self_hostname já está inicializado */
     send_discovery_announcement();
 
@@ -783,10 +813,6 @@ int main(void) {
         perror("[Sensor C:Erro] Falha na criação do socket de telemetria pos-auth");
         exit(EXIT_FAILURE);
     }
-
-    /* Thread de escuta Multicast — g_self_hostname é read-only a partir daqui */
-    if (pthread_create(&listener_tid, NULL, multicast_listener_thread, NULL) != 0)
-        perror("[Sensor C:Aviso] Falha ao criar thread Multicast");
 
     double next_heartbeat_at = monotonic_seconds() + heartbeat_delay_secs();
 

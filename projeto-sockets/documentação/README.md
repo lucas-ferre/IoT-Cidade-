@@ -156,8 +156,46 @@ Todas as simulações incorporam atrasos probabilísticos (Jitter), evitando sin
 | **Estação Ambiental** (C) | `temperature`, `humidity`, `co2`, `pm25`, `pm10`, `aqi` | Temp > 32°C ou PM2.5 alarmante (Insalubridade). |
 | **Semáforo** (Java) | `state` (Ciclo), `queue_length` (Tamanho da Fila) | Fila acima de 35 carros. |
 | **Poste Inteligente** (Lua) | `luminosity` (%), `power_consumption` (W) | Consumo acima de 32W ou queima de lâmpada (<80%). |
+| **Sensor de Enchente** (Node.js) | `water_level` (cm), `flow_rate` (L/s) | Nível d'água ≥ 150 cm (risco de transbordo). |
+| **Sensor de Ruído** (Ruby) | `noise_db` (dB), `peak_db` (dB) | Ruído ≥ 85 dB (poluição sonora). |
 
 > A Telemetria e Descobertas trafegam via **UDP**, enquanto Requisições de Controle partindo do usuário via Dashboard (Ligar/Desligar remoto) trafegam via **TCP**.
+
+---
+
+## 🖥️ Consoles de Controle por Sensor (IDLE)
+
+Cada sensor possui um **console interativo próprio, na sua própria linguagem**, mantido na pasta do sensor. Ele permite inspecionar e controlar aquele nó individualmente, falando o mesmo contrato Protobuf (`ConfigCommand`/`ConfigResponse`) já usado pelo Gateway/Dashboard.
+
+| Sensor | Arquivo | Tipo |
+|--------|---------|------|
+| Câmera (Python) | `sensor_python/console.py` | Controle (status/frequência) |
+| Semáforo (Java) | `sensor_java/Console.java` | Controle (status/frequência) |
+| Poste (Lua) | `sensor_lua/console.lua` | Controle (status/frequência) |
+| Estação de Clima (C) | `sensor_c/console.c` | **Somente status/IDLE** (nó não-controlável) |
+| Enchente (Node.js) | `sensor_node/console.js` | Controle (status/frequência) |
+| Ruído (Ruby) | `sensor_ruby/console.rb` | Controle (status/frequência) |
+
+Há **dois modos de uso**:
+
+**1. Standalone** (processo separado, via `docker exec`):
+```bash
+docker exec -it sensor_camera   python console.py
+docker exec -it sensor_semaforo java -cp .:protobuf.jar Console
+docker exec -it sensor_posto    sh -c 'eval $(luarocks --lua-version=5.4 path) && lua5.4 console.lua'
+docker exec -it sensor_enchente node console.js
+docker exec -it sensor_ruido    ruby console.rb
+# (C é somente embutido — ver abaixo)
+```
+
+**2. Embutido (IDLE no próprio processo)** — opt-in: defina `SENSOR_IDLE_CONSOLE=1` no `docker-compose.yml` do sensor desejado e anexe o terminal:
+```bash
+docker attach sensor_clima      # Ctrl-P depois Ctrl-Q para desanexar SEM matar o sensor
+```
+> O modo embutido em Lua usa poll **não-bloqueante** de stdin via `luaposix`; se indisponível, ele se desativa graciosamente e o modo standalone continua válido.
+
+**Comandos** (controláveis): `status [id]`, `on [id]`, `off [id]`, `err [id]`, `freq <segundos> [id]`, `help`, `quit`.
+**Comandos** (clima C, leitura): `status`, `agg`, `help`, `quit`. Sem `id`, aplica-se ao dispositivo padrão (primeiro da frota).
 
 ---
 
@@ -177,10 +215,13 @@ docker compose up --build -d
 ```
 
 ### Serviços Acessíveis
-1. **Dashboard UI** — Abra [http://localhost:8501](http://localhost:8501) no seu navegador predileto para visualizar tudo, comandar robôs e checar análises.
-2. **Inspeção de Bancos de Dados** (Caso possua sqlite3 na máquina):
+1. **Dashboard UI** — Abra [http://localhost:8501](http://localhost:8501) para visualizar tudo, comandar robôs e checar análises. Abas: Descoberta, Controle (com **controle em massa**), OLAP, Inspeção, **Mapa** (scatter/heatmap/mini-mapas por setor/**replay temporal**), **Auditoria**, **Alertas**, **Automação (IFTTT)** e **Observabilidade**.
+2. **Métricas Prometheus** — [http://localhost:9100/metrics](http://localhost:9100/metrics) (endpoint do Gateway) e o servidor Prometheus em [http://localhost:9090](http://localhost:9090). Grafana é opcional: aponte um data source para `http://prometheus:9090`.
+3. **Inspeção de Bancos de Dados** (Caso possua sqlite3 na máquina):
    ```bash
    docker exec gateway sqlite3 db/smartcity_gateway.db "SELECT * FROM devices;"
    ```
+
+> Para **cifrar o canal de controle** (AES-GCM + anti-replay), suba com `CONTROL_SECURE=1` no gateway e nos sensores controláveis (após `build`). Para **Docker secrets**, use o override: `docker compose -f docker-compose.yml -f docker-compose.secrets.yml up --build`.
 
 Aproveite o ambiente Smart City em sua estabilidade máxima!

@@ -15,6 +15,8 @@ class DeviceType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     DEVICE_TYPE_WEATHER_STATION: _ClassVar[DeviceType]
     DEVICE_TYPE_CAMERA: _ClassVar[DeviceType]
     DEVICE_TYPE_AIR_QUALITY: _ClassVar[DeviceType]
+    DEVICE_TYPE_FLOOD: _ClassVar[DeviceType]
+    DEVICE_TYPE_NOISE: _ClassVar[DeviceType]
 
 class DeviceStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -45,6 +47,8 @@ DEVICE_TYPE_LAMP_POST: DeviceType
 DEVICE_TYPE_WEATHER_STATION: DeviceType
 DEVICE_TYPE_CAMERA: DeviceType
 DEVICE_TYPE_AIR_QUALITY: DeviceType
+DEVICE_TYPE_FLOOD: DeviceType
+DEVICE_TYPE_NOISE: DeviceType
 STATUS_UNKNOWN: DeviceStatus
 STATUS_ON: DeviceStatus
 STATUS_OFF: DeviceStatus
@@ -133,6 +137,28 @@ class DataPayload(_message.Message):
     coord_y: int
     def __init__(self, message_id: _Optional[str] = ..., timestamp: _Optional[int] = ..., device_id: _Optional[str] = ..., current_status: _Optional[_Union[DeviceStatus, str]] = ..., metrics: _Optional[_Iterable[_Union[Metric, _Mapping]]] = ..., coord_x: _Optional[int] = ..., coord_y: _Optional[int] = ...) -> None: ...
 
+class AuthRequest(_message.Message):
+    __slots__ = ("device_id", "type", "license_key_part", "hex_service_code")
+    DEVICE_ID_FIELD_NUMBER: _ClassVar[int]
+    TYPE_FIELD_NUMBER: _ClassVar[int]
+    LICENSE_KEY_PART_FIELD_NUMBER: _ClassVar[int]
+    HEX_SERVICE_CODE_FIELD_NUMBER: _ClassVar[int]
+    device_id: str
+    type: DeviceType
+    license_key_part: str
+    hex_service_code: str
+    def __init__(self, device_id: _Optional[str] = ..., type: _Optional[_Union[DeviceType, str]] = ..., license_key_part: _Optional[str] = ..., hex_service_code: _Optional[str] = ...) -> None: ...
+
+class AuthResponse(_message.Message):
+    __slots__ = ("success", "message", "assigned_port")
+    SUCCESS_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    ASSIGNED_PORT_FIELD_NUMBER: _ClassVar[int]
+    success: bool
+    message: str
+    assigned_port: int
+    def __init__(self, success: bool = ..., message: _Optional[str] = ..., assigned_port: _Optional[int] = ...) -> None: ...
+
 class ConfigCommand(_message.Message):
     __slots__ = ("command_id", "timestamp", "update_status", "target_status", "update_frequency", "new_frequency_secs", "target_device_id")
     COMMAND_ID_FIELD_NUMBER: _ClassVar[int]
@@ -170,7 +196,7 @@ class ConfigResponse(_message.Message):
     def __init__(self, message_id: _Optional[str] = ..., command_id: _Optional[str] = ..., timestamp: _Optional[int] = ..., success: bool = ..., message: _Optional[str] = ..., updated_status: _Optional[_Union[DeviceStatus, str]] = ..., updated_frequency_secs: _Optional[int] = ...) -> None: ...
 
 class DeviceInfo(_message.Message):
-    __slots__ = ("device_id", "type", "status", "ip_address", "control_port", "is_controllable", "last_seen_timestamp", "coord_x", "coord_y")
+    __slots__ = ("device_id", "type", "status", "ip_address", "control_port", "is_controllable", "last_seen_timestamp", "coord_x", "coord_y", "aggregator_id")
     DEVICE_ID_FIELD_NUMBER: _ClassVar[int]
     TYPE_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
@@ -180,6 +206,7 @@ class DeviceInfo(_message.Message):
     LAST_SEEN_TIMESTAMP_FIELD_NUMBER: _ClassVar[int]
     COORD_X_FIELD_NUMBER: _ClassVar[int]
     COORD_Y_FIELD_NUMBER: _ClassVar[int]
+    AGGREGATOR_ID_FIELD_NUMBER: _ClassVar[int]
     device_id: str
     type: DeviceType
     status: DeviceStatus
@@ -189,7 +216,8 @@ class DeviceInfo(_message.Message):
     last_seen_timestamp: int
     coord_x: int
     coord_y: int
-    def __init__(self, device_id: _Optional[str] = ..., type: _Optional[_Union[DeviceType, str]] = ..., status: _Optional[_Union[DeviceStatus, str]] = ..., ip_address: _Optional[str] = ..., control_port: _Optional[int] = ..., is_controllable: bool = ..., last_seen_timestamp: _Optional[int] = ..., coord_x: _Optional[int] = ..., coord_y: _Optional[int] = ...) -> None: ...
+    aggregator_id: str
+    def __init__(self, device_id: _Optional[str] = ..., type: _Optional[_Union[DeviceType, str]] = ..., status: _Optional[_Union[DeviceStatus, str]] = ..., ip_address: _Optional[str] = ..., control_port: _Optional[int] = ..., is_controllable: bool = ..., last_seen_timestamp: _Optional[int] = ..., coord_x: _Optional[int] = ..., coord_y: _Optional[int] = ..., aggregator_id: _Optional[str] = ...) -> None: ...
 
 class ClientRequest(_message.Message):
     __slots__ = ("message_id", "timestamp", "type", "target_device_id", "command_payload", "query_metric", "query_op", "start_timestamp", "end_timestamp")

@@ -12,12 +12,14 @@ RUN wget -q https://repo1.maven.org/maven2/com/google/protobuf/protobuf-java/3.2
 # Copia os arquivos conforme a estrutura solicitada
 COPY ./common ./common
 COPY ./sensor_java/sensor.java .
+COPY ./sensor_java/Console.java .
+COPY ./sensor_java/ControlCrypto.java .
 
 # 1. Gera as classes Java a partir do .proto compartilhado
 RUN protoc -I=./common --java_out=. ./common/messages.proto
 
-# 2. Compila o sensor.java incluindo o JAR do Protobuf e as classes geradas
-RUN javac -cp protobuf.jar sensor.java smartcity/Messages.java
+# 2. Compila sensor.java + Console.java + ControlCrypto.java com o JAR do Protobuf
+RUN javac -cp protobuf.jar sensor.java Console.java ControlCrypto.java smartcity/Messages.java
 
 # Estágio de Runtime (Imagem leve)
 FROM eclipse-temurin:21-jre

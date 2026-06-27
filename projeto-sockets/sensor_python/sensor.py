@@ -10,6 +10,10 @@ import uuid
 from contextlib import closing
 
 import messages_pb2  # pyright: ignore[reportMissingImports]
+import control_crypto
+
+# Guarda anti-replay compartilhada por todas as conexões de controle.
+_replay_guard = control_crypto.ReplayGuard()
 
 
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "gateway")
@@ -383,8 +387,15 @@ def handle_control_client(conn: socket.socket, addr) -> None:
             raise ValueError(f"tamanho de frame invalido: {frame_size}")
 
         body = recv_exact(conn, frame_size)
+        if control_crypto.SECURE:
+            body = control_crypto.unwrap(body)
         command = messages_pb2.ConfigCommand()
         command.ParseFromString(body)
+
+        if control_crypto.SECURE:
+            ok, reason = _replay_guard.check(command.command_id, command.timestamp)
+            if not ok:
+                raise ValueError(f"comando rejeitado (anti-replay): {reason}")
 
         target_device_id = command.target_device_id or DEVICE_ID
         with state_lock:
@@ -419,6 +430,8 @@ def handle_control_client(conn: socket.socket, addr) -> None:
             updated_frequency_secs=current_frequency,
         )
         response_bytes = response.SerializeToString()
+        if control_crypto.SECURE:
+            response_bytes = control_crypto.wrap(response_bytes)
         conn.sendall(struct.pack(">I", len(response_bytes)) + response_bytes)
 
         send_discovery_response(target_device_id)
@@ -433,6 +446,8 @@ def handle_control_client(conn: socket.socket, addr) -> None:
                 message=f"Falha ao aplicar comando na camera: {exc}",
             )
             response_bytes = response.SerializeToString()
+            if control_crypto.SECURE:
+                response_bytes = control_crypto.wrap(response_bytes)
             conn.sendall(struct.pack(">I", len(response_bytes)) + response_bytes)
         except OSError:
             pass
@@ -524,28 +539,29 @@ def multicast_listener_loop() -> None:
                     print(f"[sensor_camera] | [Sensor Python:Erro] Falha no multicast: {exc}")
                 continue
 
-            if data == b"SMARTCITY_DISCOVERY_PROBE":
-                jitter = discovery_probe_jitter_secs()
-                send_at = time.monotonic() + jitter
-                try:
-                    # put_nowait garante que o listener nunca bloqueia.
-                    # Se a fila estiver cheia (rajada de probes), o probe é
-                    # descartado — o dispatch já tem respostas suficientes pendentes.
-                    _probe_dispatch_queue.put_nowait(send_at)
-                    print(
-                        f"[sensor_camera] | [Sensor Python:Multicast] Probe de {addr[0]} "
-                        f"enfileirado — resposta agendada em {jitter * 1000:.0f} ms "
-                        f"({_probe_dispatch_queue.qsize()} na fila)."
-                    )
-                except queue.Full:
-                    print(
-                        f"[sensor_camera] | [Sensor Python:Multicast] Fila cheia "
-                        f"({_probe_dispatch_queue.maxsize} itens) — probe de {addr[0]} descartado."
-                    )
-            else:
-                try:
-                    loadMsg = messages_pb2.AggregatorLoad()
-                    loadMsg.ParseFromString(data)
+            try:
+                loadMsg = messages_pb2.AggregatorLoad()
+                loadMsg.ParseFromString(data)
+                
+                if loadMsg.aggregator_id == "GATEWAY_PROBE":
+                    jitter = discovery_probe_jitter_secs()
+                    send_at = time.monotonic() + jitter
+                    try:
+                        # put_nowait garante que o listener nunca bloqueia.
+                        # Se a fila estiver cheia (rajada de probes), o probe é
+                        # descartado — o dispatch já tem respostas suficientes pendentes.
+                        _probe_dispatch_queue.put_nowait(send_at)
+                        print(
+                            f"[sensor_camera] | [Sensor Python:Multicast] Probe de {addr[0]} "
+                            f"enfileirado — resposta agendada em {jitter * 1000:.0f} ms "
+                            f"({_probe_dispatch_queue.qsize()} na fila)."
+                        )
+                    except queue.Full:
+                        print(
+                            f"[sensor_camera] | [Sensor Python:Multicast] Fila cheia "
+                            f"({_probe_dispatch_queue.maxsize} itens) — probe de {addr[0]} descartado."
+                        )
+                else:
                     score = (loadMsg.cpu_load * 0.4) + (loadMsg.queue_size * 0.6)
                     
                     global best_aggregator_ip, best_aggregator_score
@@ -555,8 +571,8 @@ def multicast_listener_loop() -> None:
                                 print(f"[sensor_camera] | [Sensor Python:LoadBalancer] Rota alterada para {loadMsg.aggregator_id} (Score: {best_aggregator_score:.2f} -> {score:.2f})")
                                 best_aggregator_ip = loadMsg.ip_address
                             best_aggregator_score = score
-                except Exception as e:
-                    pass
+            except Exception as e:
+                pass
 
 
 def probe_dispatch_loop() -> None:
@@ -654,6 +670,10 @@ def main() -> None:
     threading.Thread(target=control_server_loop, daemon=True).start()
     threading.Thread(target=multicast_listener_loop, daemon=True).start()
 
+    print("[sensor_camera] | [Sensor Python] Aguardando broadcast de AggregatorLoad para descobrir IP real...")
+    while best_aggregator_ip == GATEWAY_HOST and not shutdown_event.is_set():
+        time.sleep(0.1)
+
     send_discovery_response()
     
     assigned_port = authenticate_with_gateway()
@@ -664,6 +684,16 @@ def main() -> None:
 
     threading.Thread(target=probe_dispatch_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+
+    # Console IDLE embutido (opt-in via SENSOR_IDLE_CONSOLE). Conecta-se ao próprio
+    # servidor de controle local; requer terminal anexado (stdin_open + tty).
+    if os.getenv("SENSOR_IDLE_CONSOLE", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            import console
+            console.start_embedded(CONTROL_TCP_PORT)
+            print("[sensor_camera] | [IDLE] Console embutido ativo (use 'docker attach').")
+        except Exception as exc:
+            print(f"[sensor_camera] | [IDLE] Falha ao iniciar console embutido: {exc}")
 
     while not shutdown_event.is_set():
         for device_id in threshold_due_device_ids():

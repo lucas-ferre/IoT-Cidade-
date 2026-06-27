@@ -12,6 +12,7 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.params.XAddParams;
 import smartcity.Messages.AggregatorLoad;
 
 import java.net.InetAddress;
@@ -31,6 +32,22 @@ public class AggregatorApplication {
     public static final int TELEMETRY_PORT = 5000;
     public static final int DISCOVERY_PORT = 5002;
     public static final ConcurrentHashMap<Integer, io.netty.channel.Channel> activePorts = new ConcurrentHashMap<>();
+
+    /** Lê um segredo de <NAME>_FILE (Docker secret) caindo para a env var <NAME>. */
+    static String readSecret(String name, String def) {
+        String filePath = System.getenv(name + "_FILE");
+        if (filePath != null && !filePath.isEmpty()) {
+            try {
+                return new String(
+                    java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(filePath)),
+                    java.nio.charset.StandardCharsets.UTF_8
+                ).trim();
+            } catch (Exception e) {
+                System.err.println("Falha ao ler " + name + "_FILE: " + e.getMessage());
+            }
+        }
+        return System.getenv().getOrDefault(name, def);
+    }
 
     public static void main(String[] args) throws InterruptedException {
         System.out.println("Iniciando Agregador de Alta Performance Java (Netty)...");
@@ -138,7 +155,11 @@ public class AggregatorApplication {
                             .setIpAddress(ipAddress)
                             .setTelemetryPort(5000)
                             .setDiscoveryPort(5002)
-                            .setCpuLoad(Runtime.getRuntime().availableProcessors() * 5.0)
+                            // Base fixa equivalente à do agregador Rust (5.0). Antes era
+                            // availableProcessors()*5.0 (~40), o que inflava o score e fazia
+                            // os sensores SEMPRE escolherem o Rust — o Java ficava ocioso.
+                            // Com bases iguais, o tamanho da fila passa a decidir a rota.
+                            .setCpuLoad(5.0)
                             .setQueueSize(telemetryQueue.size())
                             .setTimestamp(System.currentTimeMillis() / 1000)
                             .build();
@@ -176,14 +197,20 @@ public class AggregatorApplication {
 
         private static final byte[] AES_KEY;
         static {
-            String rawKey = System.getenv().getOrDefault("AES_SECRET_KEY", "SmartCityKey1234");
+            String rawKey = readSecret("AES_SECRET_KEY", "SmartCityKey1234");
             byte[] keyBytes = new byte[16];
             byte[] rawBytes = rawKey.getBytes();
             System.arraycopy(rawBytes, 0, keyBytes, 0, Math.min(rawBytes.length, 16));
             AES_KEY = keyBytes;
         }
         private static final SecureRandom secureRandom = new SecureRandom();
-        
+
+        // Trimming aproximado dos streams Redis: limita o crescimento ilimitado
+        // (antes os xadd não tinham MAXLEN e a memória do Redis crescia sem fim).
+        private static final long MAX_STREAM_LEN = 100_000L;
+        private static final XAddParams STREAM_TRIM =
+            XAddParams.xAddParams().maxLen(MAX_STREAM_LEN).approximateTrimming();
+
         private byte[] encryptPayload(byte[] payload) throws Exception {
             byte[] nonce = new byte[12];
             secureRandom.nextBytes(nonce);
@@ -204,7 +231,9 @@ public class AggregatorApplication {
         @Override
         public void run() {
             System.out.println("Redis Writer Worker iniciado.");
-            byte[] aggregatorId = System.getenv().getOrDefault("AGGREGATOR_ID", "java_netty_1").getBytes();
+            String aggIdStr = System.getenv().getOrDefault("AGGREGATOR_ID", "java_netty_1");
+            byte[] aggregatorId = aggIdStr.getBytes();
+            long lastHeartbeat = 0L;
             while (!Thread.currentThread().isInterrupted()) {
                 boolean didWork = false;
                 try (Jedis jedis = jedisPool.getResource()) {
@@ -215,7 +244,7 @@ public class AggregatorApplication {
                             Map<byte[], byte[]> map = new HashMap<>();
                             map.put("payload".getBytes(), encrypted);
                             map.put("aggregator".getBytes(), aggregatorId);
-                            jedis.xadd("telemetry_stream".getBytes(), null, map);
+                            jedis.xadd("telemetry_stream".getBytes(), STREAM_TRIM, map);
                             didWork = true;
                         }
                     }
@@ -226,9 +255,16 @@ public class AggregatorApplication {
                             Map<byte[], byte[]> map = new HashMap<>();
                             map.put("payload".getBytes(), encrypted);
                             map.put("aggregator".getBytes(), aggregatorId);
-                            jedis.xadd("discovery_stream".getBytes(), null, map);
+                            jedis.xadd("discovery_stream".getBytes(), STREAM_TRIM, map);
                             didWork = true;
                         }
+                    }
+
+                    // [Fase E] Heartbeat de saúde (TTL 30s), lido pelo gateway.
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - lastHeartbeat >= 2000L) {
+                        jedis.setex("agg_heartbeat:" + aggIdStr, 30L, String.valueOf(nowMs / 1000L));
+                        lastHeartbeat = nowMs;
                     }
                 } catch (Exception e) {
                     System.err.println("Erro ao conectar ou gravar no Redis: " + e.getMessage());

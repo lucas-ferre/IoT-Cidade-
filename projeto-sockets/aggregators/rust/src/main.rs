@@ -1,5 +1,6 @@
 use prost::Message;
 use redis::AsyncCommands;
+use redis::streams::StreamMaxlen;
 use std::env;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,6 +16,19 @@ use rand::RngCore;
 
 pub mod smartcity {
     include!(concat!(env!("OUT_DIR"), "/smartcity.rs"));
+}
+
+// Trimming aproximado dos streams Redis para limitar o uso de memória.
+const MAX_STREAM_LEN: usize = 100_000;
+
+/// Lê um segredo de <NAME>_FILE (Docker secret) caindo para a env var <NAME>.
+fn read_secret(name: &str, default: &str) -> String {
+    if let Ok(path) = env::var(format!("{}_FILE", name)) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            return content.trim().to_string();
+        }
+    }
+    env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
 #[tokio::main]
@@ -65,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let channel = format!("agg_control_{}", pubsub_agg_id);
             println!("Ouvindo comandos no canal de controle: {}", channel);
             loop {
-                // brpop returns a tuple (key, value)
+                // blpop retorna uma tupla (key, value)
                 let res: redis::RedisResult<Vec<String>> = con.blpop(&channel, 0).await;
                 if let Ok(item) = res {
                     if item.len() == 2 {
@@ -116,7 +130,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dummy.local_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "127.0.0.1".to_string())
     };
 
+    // [Fase E] Conexão Redis p/ heartbeat de saúde (health two-way ACK).
+    let mut hb_conn = client.get_multiplexed_async_connection().await.ok();
+
     loop {
+        let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
         let load = smartcity::AggregatorLoad {
             aggregator_id: aggregator_id.clone(),
             ip_address: local_ip.clone(),
@@ -124,16 +142,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             discovery_port: 5002,
             cpu_load: 5.0, // Fixo para simplificar
             queue_size: queue_size.load(Ordering::Relaxed) as i32,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+            timestamp: now_ts,
         };
 
         let mut buf = Vec::new();
         load.encode(&mut buf)?;
         socket.send_to(&buf, &addr)?;
-        
+
+        // Heartbeat de saúde no Redis (TTL 30s) — lido pelo gateway (Fase E).
+        if let Some(conn) = hb_conn.as_mut() {
+            let key = format!("agg_heartbeat:{}", aggregator_id);
+            let _: redis::RedisResult<()> = conn.set_ex(key, now_ts, 30).await;
+        }
+
         println!("Anunciado Load: {} itens processados no último ciclo.", load.queue_size);
         queue_size.store(0, Ordering::Relaxed); // Reseta a métrica a cada ciclo
-        
+
         sleep(Duration::from_secs(2)).await;
     }
 }
@@ -158,7 +182,7 @@ async fn listen_udp(
 
     println!("Escutando UDP em {}", bind_addr);
     
-    let raw_key = env::var("AES_SECRET_KEY").unwrap_or_else(|_| "SmartCityKey1234".to_string());
+    let raw_key = read_secret("AES_SECRET_KEY", "SmartCityKey1234");
     let mut key_bytes = [0u8; 16];
     let bytes_to_copy = std::cmp::min(16, raw_key.len());
     key_bytes[..bytes_to_copy].copy_from_slice(&raw_key.as_bytes()[..bytes_to_copy]);
@@ -187,10 +211,11 @@ async fn listen_udp(
                 final_payload.extend_from_slice(&nonce_bytes);
                 final_payload.append(&mut encrypted_payload);
                 
-                // Grava no Redis Streams
-                let _: redis::RedisResult<()> = conn.xadd(
-                    stream_name, 
-                    "*", 
+                // Grava no Redis Streams com MAXLEN aproximado (limita memória).
+                let _: redis::RedisResult<()> = conn.xadd_maxlen(
+                    stream_name,
+                    StreamMaxlen::Approx(MAX_STREAM_LEN),
+                    "*",
                     &[
                         ("payload", final_payload.as_slice()),
                         ("aggregator", aggregator_id.as_bytes())
