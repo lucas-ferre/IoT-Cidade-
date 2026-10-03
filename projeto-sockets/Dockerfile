@@ -5,7 +5,9 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN pip install --no-cache-dir protobuf aiosqlite
+COPY ./gateway/requirements.txt ./gateway/requirements.txt
+RUN python -m pip install --no-cache-dir --requirement ./gateway/requirements.txt \
+    && python -m pip check
 COPY ./gateway ./gateway
 COPY ./common ./common
 RUN protoc -I=./common --python_out=./gateway ./common/messages.proto
@@ -23,7 +25,8 @@ WORKDIR /app
 COPY ./sensor_c .
 COPY ./common/messages.proto .
 RUN protoc-c --c_out=. messages.proto
-RUN gcc -o sensor_c sensor.c messages.pb-c.c -lprotobuf-c
+RUN gcc -std=c11 -Wall -Wextra -Werror test_aqi.c -lm -o test_aqi && ./test_aqi
+RUN gcc -o sensor_c sensor.c messages.pb-c.c -lprotobuf-c -lm -pthread
 CMD ["./sensor_c"]
 
 FROM ubuntu:24.04 AS sensor_posto
@@ -35,7 +38,8 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 RUN luarocks --lua-version=5.4 install lua-protobuf && \
-    luarocks --lua-version=5.4 install luasocket
+    luarocks --lua-version=5.4 install luasocket    && \
+    luarocks --lua-version=5.4 install luaposix
 WORKDIR /app
 COPY ./sensor_lua/sensor.lua .
 COPY ./common/messages.proto .
@@ -63,19 +67,57 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN pip install --no-cache-dir protobuf
+COPY ./sensor_python/requirements.txt ./sensor_python/requirements.txt
+RUN python -m pip install --no-cache-dir --requirement ./sensor_python/requirements.txt \
+    && python -m pip check
 COPY ./sensor_python ./sensor_python
 COPY ./common ./common
 RUN protoc -I=./common --python_out=./sensor_python ./common/messages.proto
 WORKDIR /app/sensor_python
 CMD ["python", "sensor.py"]
 
+FROM golang:1.23-bookworm AS sensor_estacionamento_builder
+ARG PROTOC_GEN_GO_VERSION=v1.36.6
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src/sensor_go
+COPY ./sensor_go/go.mod ./sensor_go/go.sum ./
+RUN go mod download \
+    && go mod verify \
+    && GOBIN=/usr/local/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@${PROTOC_GEN_GO_VERSION}
+COPY ./sensor_go/main.go ./sensor_go/main_test.go ./
+COPY ./common/messages.proto /src/common/messages.proto
+RUN mkdir -p ./proto \
+    && protoc \
+        --proto_path=/src/common \
+        --go_out=./proto \
+        --go_opt=paths=source_relative \
+        /src/common/messages.proto \
+    && go test -race -mod=readonly ./... \
+    && CGO_ENABLED=0 GOOS=linux go build -mod=readonly \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /out/sensor-go \
+        .
+
+FROM gcr.io/distroless/static-debian12:nonroot AS sensor_estacionamento
+WORKDIR /app
+COPY --from=sensor_estacionamento_builder --chown=65532:65532 /out/sensor-go /app/sensor-go
+EXPOSE 5007
+USER 65532:65532
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/app/sensor-go", "healthcheck"]
+ENTRYPOINT ["/app/sensor-go"]
+
 FROM python:3.11-slim AS dashboard
 RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN pip install --no-cache-dir streamlit protobuf
+COPY ./client/requirements.txt ./client/requirements.txt
+RUN python -m pip install --no-cache-dir --requirement ./client/requirements.txt \
+    && python -m pip check
 COPY ./client ./client
 COPY ./common ./common
 RUN protoc -I=./common --python_out=./client ./common/messages.proto

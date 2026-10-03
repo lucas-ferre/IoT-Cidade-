@@ -1,90 +1,63 @@
 services:
   # ==================================================================
-  # 0. CACHE & MESSAGE BROKER (REDIS)
-  # ==================================================================
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
-    networks:
-      - smart_city_net
-    restart: always
-
-  # ==================================================================
-  # 1.A. AGREGADOR JAVA (NETTY)
-  # ==================================================================
-  aggregator_java:
-    build:
-      context: .
-      dockerfile: aggregators/java/Dockerfile
-    container_name: aggregator_java
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - AGGREGATOR_ID=java_netty_1
-      - MULTICAST_GROUP=239.0.0.1
-      - MULTICAST_PORT=5005
-      - AES_SECRET_KEY=SmartCityKey1234
-    networks:
-      - smart_city_net
-    restart: always
-    depends_on:
-      - redis
-
-  # ==================================================================
-  # 1.B. AGREGADOR RUST (TOKIO)
-  # ==================================================================
-  aggregator_rust:
-    build:
-      context: .
-      dockerfile: aggregators/rust/Dockerfile
-    container_name: aggregator_rust
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - AGGREGATOR_ID=rust_tokio_1
-      - MULTICAST_GROUP=239.0.0.1
-      - MULTICAST_PORT=5005
-      - AES_SECRET_KEY=SmartCityKey1234
-    networks:
-      - smart_city_net
-    restart: always
-    depends_on:
-      - redis
-
-  # ==================================================================
-  # 1. GATEWAY INTELIGENTE (HUB COORDENADOR & OLAP)
+  # 1. GATEWAY INTELIGENTE (HUB COORDENADOR)
   # ==================================================================
   gateway:
     build:
       context: .
       dockerfile: gateway/Dockerfile
-      args:
-        TARGET_SERVICE: gateway
     container_name: gateway
     ports:
-      # UDP 5000 e 5002 foram movidos para os agregadores
-      - "5001:5001/tcp"  # Interface de streaming analítico e atuação
-      - "5007:5007/tcp"  # Interface de autenticação dos sensores
-      - "9100:9100/tcp"  # Endpoint de métricas Prometheus (/metrics) — Fase E
+      # Seguro por padrão: acessível somente a partir do host local.
+      # Consulte ../SECURITY.md antes de alterar BIND_ADDRESS para 0.0.0.0.
+      - "${BIND_ADDRESS:-127.0.0.1}:5000:5000/udp"  # Ingestão de telemetria contínua
+      - "${BIND_ADDRESS:-127.0.0.1}:5001:5001/tcp"  # Interface de streaming analítico e atuação
+      - "${BIND_ADDRESS:-127.0.0.1}:5002:5002/udp"  # Registro de descoberta de sensores externos
     volumes:
       - gateway_db:/app/gateway/db
     environment:
-      - PYTHONUNBUFFERED=1
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - GATEWAY_LICENSE_KEY=SMARTCITY-V1-FULL-LICENSE
-      - AES_SECRET_KEY=SmartCityKey1234
-      # Cifra+anti-replay do canal de controle. Só ligar (=1) quando TODOS os
-      # sensores controláveis (câmera/semáforo/poste) já suportarem o modo seguro.
-      - CONTROL_SECURE=0
+      PYTHONUNBUFFERED: "1"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      DB_POOL_SIZE: "${DB_POOL_SIZE:-4}"
+      WAL_CHECKPOINT_INTERVAL_SECS: "${WAL_CHECKPOINT_INTERVAL_SECS:-300}"
+      TELEMETRY_QUEUE_MAXSIZE: "${TELEMETRY_QUEUE_MAXSIZE:-10000}"
+      TELEMETRY_BATCH_MAX_PAYLOADS: "${TELEMETRY_BATCH_MAX_PAYLOADS:-100}"
+      TELEMETRY_BATCH_MAX_ROWS: "${TELEMETRY_BATCH_MAX_ROWS:-500}"
+      TELEMETRY_BATCH_FLUSH_INTERVAL_SECS: "${TELEMETRY_BATCH_FLUSH_INTERVAL_SECS:-1.0}"
+      TELEMETRY_SHUTDOWN_TIMEOUT_SECS: "${TELEMETRY_SHUTDOWN_TIMEOUT_SECS:-20}"
+      DISCOVERY_MAX_IN_FLIGHT: "${DISCOVERY_MAX_IN_FLIGHT:-256}"
+      DISCOVERY_PROBE_INTERVAL_SECS: "${DISCOVERY_PROBE_INTERVAL_SECS:-15}"
+      MULTICAST_TTL: "${MULTICAST_TTL:-1}"
+      DEVICE_OFFLINE_TIMEOUT_SECS: "${DEVICE_OFFLINE_TIMEOUT_SECS:-45}"
+      DEVICE_OFFLINE_CHECK_INTERVAL_SECS: "${DEVICE_OFFLINE_CHECK_INTERVAL_SECS:-5}"
+      METRICS_RAW_RETENTION_SECS: "${METRICS_RAW_RETENTION_SECS:-604800}"
+      ROLLUP_1M_RETENTION_SECS: "${ROLLUP_1M_RETENTION_SECS:-2592000}"
+      ROLLUP_5M_RETENTION_SECS: "${ROLLUP_5M_RETENTION_SECS:-15552000}"
+      ROLLUP_1H_RETENTION_SECS: "${ROLLUP_1H_RETENTION_SECS:-31536000}"
+      METRICS_RETENTION_INTERVAL_SECS: "${METRICS_RETENTION_INTERVAL_SECS:-3600}"
+      ROLLUP_BACKFILL_ON_STARTUP: "${ROLLUP_BACKFILL_ON_STARTUP:-1}"
+      OLAP_RAW_MAX_WINDOW_SECS: "${OLAP_RAW_MAX_WINDOW_SECS:-3600}"
+      OLAP_1M_MAX_WINDOW_SECS: "${OLAP_1M_MAX_WINDOW_SECS:-86400}"
+      OLAP_5M_MAX_WINDOW_SECS: "${OLAP_5M_MAX_WINDOW_SECS:-604800}"
+      OLAP_MAX_QUERY_WINDOW_SECS: "${OLAP_MAX_QUERY_WINDOW_SECS:-2592000}"
+      OLAP_MAX_GRAPH_POINTS: "${OLAP_MAX_GRAPH_POINTS:-2000}"
+      TCP_CLIENT_READ_TIMEOUT: "${TCP_CLIENT_READ_TIMEOUT:-10}"
+      TCP_CLIENT_IDLE_TIMEOUT: "${TCP_CLIENT_IDLE_TIMEOUT:-60}"
+      TCP_MAX_FRAME_BYTES: "${TCP_MAX_FRAME_BYTES:-1048576}"
+      UDP_MAX_DATAGRAM_BYTES: "${UDP_MAX_DATAGRAM_BYTES:-16384}"
+      MAX_DEVICE_ID_LENGTH: "${MAX_DEVICE_ID_LENGTH:-128}"
+      MAX_MESSAGE_ID_LENGTH: "${MAX_MESSAGE_ID_LENGTH:-128}"
+      MAX_METRIC_NAME_LENGTH: "${MAX_METRIC_NAME_LENGTH:-128}"
+      MAX_METRIC_UNIT_LENGTH: "${MAX_METRIC_UNIT_LENGTH:-32}"
+      MAX_METRICS_PER_PAYLOAD: "${MAX_METRICS_PER_PAYLOAD:-64}"
+      MESSAGE_MAX_AGE_SECS: "${MESSAGE_MAX_AGE_SECS:-86400}"
+      MESSAGE_MAX_FUTURE_SKEW_SECS: "${MESSAGE_MAX_FUTURE_SKEW_SECS:-300}"
     networks:
       - smart_city_net
     restart: always
-    depends_on:
-      - redis
-    stop_grace_period: 10s
+    # SIGTERM interrompe entradas e drena a fila antes de fechar o SQLite.
+    # A margem inclui os 20s de drenagem e o timeout de escrita do banco.
+    stop_grace_period: 45s
     healthcheck:
       test: [
         "CMD-SHELL",
@@ -102,28 +75,22 @@ services:
     build:
       context: .
       dockerfile: sensor_c/Dockerfile
-      args:
-        TARGET_SERVICE: sensor_clima
     container_name: sensor_clima
     environment:
-      - C_DEVICE_COUNT=6
-      - SENSOR_LICENSE_PART=V1-FULL
-      # =1 + 'docker attach sensor_clima' para o console IDLE de status embutido
-      - SENSOR_IDLE_CONSOLE=0
-    stdin_open: true
-    tty: true
+      C_DEVICE_COUNT: "${C_DEVICE_COUNT:-6}"  # Ajustável sem recompilação
     depends_on:
       gateway:
         condition: service_healthy
-      aggregator_java:
-        condition: service_started
-      aggregator_rust:
-        condition: service_started
     networks:
       - smart_city_net
     restart: on-failure
+    # sig_atomic_t keep_running + sigaction(SIGTERM) garantem saída limpa em < 1s.
     stop_grace_period: 5s
     healthcheck:
+      # O sensor C não expõe nenhuma porta TCP (não controlável).
+      # kill -0 verifica se PID 1 existe e está responsivo a sinais —
+      # mais robusto que inspecionar /proc/1/cmdline, que passaria para
+      # qualquer processo cujo nome contenha "sensor_c".
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
       timeout: 3s
@@ -137,27 +104,23 @@ services:
     build:
       context: .
       dockerfile: sensor_lua/Dockerfile
-      args:
-        TARGET_SERVICE: sensor_posto
     container_name: sensor_posto
     environment:
-      - SENSOR_LICENSE_PART=V1-FULL
-      # =1 + 'docker attach sensor_posto' para o console IDLE embutido (requer luaposix)
-      - SENSOR_IDLE_CONSOLE=0
-      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
-      - AES_SECRET_KEY=SmartCityKey1234
-      - CONTROL_SECURE=0
-    stdin_open: true
-    tty: true
+      LUA_DEVICE_COUNT: "${LUA_DEVICE_COUNT:-3}"
+      CONTROL_COMMAND_MAX_AGE_SECS: "${CONTROL_COMMAND_MAX_AGE_SECS:-300}"
+      CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS: "${CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS:-30}"
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
+    # posix.signal(SIGTERM) via luaposix seta keep_running=false;
+    # teardown envia STATUS_OFF e fecha sockets em < 1s.
     stop_signal: SIGTERM
     stop_grace_period: 5s
     healthcheck:
+      # CONTROL_TCP_PORT = 5006 (sensor_lua/sensor.lua)
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/5006'"]
       interval: 10s
       timeout: 3s
@@ -171,24 +134,19 @@ services:
     build:
       context: .
       dockerfile: sensor_java/Dockerfile
-      args:
-        TARGET_SERVICE: sensor_java
     container_name: sensor_semaforo
     environment:
-      - SENSOR_LICENSE_PART=V1-FULL
-      # =1 + 'docker attach sensor_semaforo' para o console IDLE embutido
-      - SENSOR_IDLE_CONSOLE=0
-      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
-      - AES_SECRET_KEY=SmartCityKey1234
-      - CONTROL_SECURE=0
-    stdin_open: true
-    tty: true
+      JAVA_DEVICE_COUNT: "${JAVA_DEVICE_COUNT:-3}"
+      CONTROL_COMMAND_MAX_AGE_SECS: "${CONTROL_COMMAND_MAX_AGE_SECS:-300}"
+      CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS: "${CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS:-30}"
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
+    # Thread.interrupt() propaga para os loops de telemetria e TCP,
+    # encerrando ordenadamente em < 1s.
     stop_grace_period: 5s
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/5003'"]
@@ -204,25 +162,19 @@ services:
     build:
       context: .
       dockerfile: sensor_python/Dockerfile
-      args:
-        TARGET_SERVICE: sensor_camera
     container_name: sensor_camera
     environment:
-      - PYTHONUNBUFFERED=1
-      - SENSOR_LICENSE_PART=V1-FULL
-      # =1 + 'docker attach sensor_camera' para o console IDLE embutido
-      - SENSOR_IDLE_CONSOLE=0
-      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
-      - AES_SECRET_KEY=SmartCityKey1234
-      - CONTROL_SECURE=0
-    stdin_open: true
-    tty: true
+      PYTHONUNBUFFERED: "1"
+      CAMERA_DEVICE_COUNT: "${CAMERA_DEVICE_COUNT:-3}"
+      CONTROL_COMMAND_MAX_AGE_SECS: "${CONTROL_COMMAND_MAX_AGE_SECS:-300}"
+      CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS: "${CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS:-30}"
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
+    # signal.signal(SIGTERM) seta shutdown_event; threads encerram em < 1s.
     stop_grace_period: 5s
     healthcheck:
       test: [
@@ -235,106 +187,47 @@ services:
       start_period: 5s
 
   # ==================================================================
-  # 5.B. SENSOR DE ENCHENTE / NÍVEL D'ÁGUA (NÓ NODE.JS - CONTROLÁVEL)
+  # 6. ESTACIONAMENTO INTELIGENTE (NÓ GO - CONTROLÁVEL)
   # ==================================================================
-  sensor_enchente:
+  sensor_estacionamento:
     build:
       context: .
-      dockerfile: sensor_node/Dockerfile
-    container_name: sensor_enchente
+      dockerfile: sensor_go/Dockerfile
+    container_name: sensor_estacionamento
     environment:
-      - SENSOR_LICENSE_PART=V1-FULL
-      - FLOOD_DEVICE_COUNT=4
-      # =1 + 'docker attach sensor_enchente' para o console IDLE embutido
-      - SENSOR_IDLE_CONSOLE=0
-      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
-      - AES_SECRET_KEY=SmartCityKey1234
-      - CONTROL_SECURE=0
-    stdin_open: true
-    tty: true
+      GO_PARKING_DEVICE_COUNT: "${GO_PARKING_DEVICE_COUNT:-3}"
+      GATEWAY_HOST: "gateway"
+      SENSOR_HOSTNAME: "sensor_estacionamento"
+      SENSOR_HEARTBEAT_INTERVAL_SECS: "${SENSOR_HEARTBEAT_INTERVAL_SECS:-10}"
+      SENSOR_HEARTBEAT_JITTER_SECS: "${SENSOR_HEARTBEAT_JITTER_SECS:-2}"
+      SENSOR_DISCOVERY_JITTER_SECS: "${SENSOR_DISCOVERY_JITTER_SECS:-2}"
     depends_on:
       gateway:
         condition: service_healthy
-      aggregator_java:
-        condition: service_started
-      aggregator_rust:
-        condition: service_started
     networks:
       - smart_city_net
     restart: on-failure
     stop_grace_period: 5s
     healthcheck:
-      test: [
-        "CMD-SHELL",
-        "node -e 'require(\"net\").connect(5010,\"127.0.0.1\").on(\"connect\",()=>process.exit(0)).on(\"error\",()=>process.exit(1))' || exit 1"
-      ]
+      test: ["CMD", "/app/sensor-go", "healthcheck"]
       interval: 10s
       timeout: 3s
       retries: 3
-      start_period: 10s
+      start_period: 5s
 
   # ==================================================================
-  # 5.C. SENSOR DE RUÍDO AMBIENTE (NÓ RUBY - CONTROLÁVEL)
-  # ==================================================================
-  sensor_ruido:
-    build:
-      context: .
-      dockerfile: sensor_ruby/Dockerfile
-    container_name: sensor_ruido
-    environment:
-      - SENSOR_LICENSE_PART=V1-FULL
-      - NOISE_DEVICE_COUNT=4
-      # =1 + 'docker attach sensor_ruido' para o console IDLE embutido
-      - SENSOR_IDLE_CONSOLE=0
-      # Cifra+anti-replay do canal de controle (precisa casar com o gateway).
-      - AES_SECRET_KEY=SmartCityKey1234
-      - CONTROL_SECURE=0
-    stdin_open: true
-    tty: true
-    depends_on:
-      gateway:
-        condition: service_healthy
-      aggregator_java:
-        condition: service_started
-      aggregator_rust:
-        condition: service_started
-    networks:
-      - smart_city_net
-    restart: on-failure
-    stop_grace_period: 5s
-    healthcheck:
-      test: [
-        "CMD-SHELL",
-        "ruby -e 'require \"socket\"; TCPSocket.new(\"127.0.0.1\", 5011).close' || exit 1"
-      ]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
-
-  # ==================================================================
-  # 6. CLIENTE ANALÍTICO (DASHBOARD STREAMLIT)
+  # 7. CLIENTE ANALÍTICO (DASHBOARD STREAMLIT)
   # ==================================================================
   dashboard:
     build:
       context: .
       dockerfile: client/Dockerfile
-      args:
-        TARGET_SERVICE: dashboard
     container_name: dashboard
     ports:
-      - "8501:8501"
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      # Login do dashboard. Para tirar do texto puro, use DASHBOARD_PASSWORD_FILE
-      # (Docker secret) — ver docker-compose.secrets.yml. Vazio = acesso aberto.
-      - DASHBOARD_PASSWORD=smartcity
+      - "${BIND_ADDRESS:-127.0.0.1}:8501:8501"
     depends_on:
       gateway:
         condition: service_healthy
-      redis:
-        condition: service_started
     networks:
       - smart_city_net
     restart: on-failure
@@ -348,66 +241,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
-
-  # ==================================================================
-  # 7. SERVIÇO DE BACKUP ANALÍTICO (GOLANG)
-  # ==================================================================
-  backup_go:
-    build:
-      context: ./backup_go
-      dockerfile: Dockerfile
-    container_name: backup_go
-    ports:
-      - "8080:8080"
-    volumes:
-      - gateway_db:/app/gateway_db:ro
-      - ./backups:/backups
-    environment:
-      - DB_PATH=/app/gateway_db/smartcity_gateway.db
-      - BACKUP_DIR=/backups
-    networks:
-      - smart_city_net
-    restart: always
-    depends_on:
-      - gateway
-
-  # ==================================================================
-  # 8. ALEXA VOICE INTEGRATION (ASK-SDK)
-  # ==================================================================
-  alexa_skill:
-    build:
-      context: .
-      dockerfile: alexa_skill/Dockerfile
-    container_name: alexa_skill
-    ports:
-      - "5008:5008"
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    depends_on:
-      gateway:
-        condition: service_healthy
-      redis:
-        condition: service_started
-    networks:
-      - smart_city_net
-    restart: on-failure
-
-  # ==================================================================
-  # 9. OBSERVABILIDADE — PROMETHEUS (raspa /metrics do Gateway) — Fase E
-  # ==================================================================
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    networks:
-      - smart_city_net
-    restart: always
-    depends_on:
-      - gateway
 
 networks:
   smart_city_net:

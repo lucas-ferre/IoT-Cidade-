@@ -1,3 +1,4 @@
+import math
 import os
 import queue
 import random
@@ -10,18 +11,11 @@ import uuid
 from contextlib import closing
 
 import messages_pb2  # pyright: ignore[reportMissingImports]
-import control_crypto
-
-# Guarda anti-replay compartilhada por todas as conexões de controle.
-_replay_guard = control_crypto.ReplayGuard()
 
 
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "gateway")
 GATEWAY_TELEMETRY_PORT = 5000
 GATEWAY_DISCOVERY_PORT = 5002
-AUTH_TCP_PORT = 5007
-SENSOR_LICENSE_PART = os.getenv("SENSOR_LICENSE_PART", "V1-FULL")
-SENSOR_HEX_CODE = "0D"
 
 CONTROL_TCP_PORT = 5004
 MULTICAST_GROUP = "239.0.0.1"
@@ -31,19 +25,9 @@ SECTORS = (
     ("Pici", "pici"),
     ("Benfica", "benfica"),
     ("Porangabussu", "porangabussu"),
-    ("Labomar", "labomar"),
 )
 CAMERA_DEVICE_COUNT = max(1, int(os.getenv("CAMERA_DEVICE_COUNT", str(len(SECTORS)))))
-def get_local_ip() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect((GATEWAY_HOST, 5000))
-            return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-
-DEVICE_IP = get_local_ip()
-DEVICE_HOSTNAME = DEVICE_IP
+DEVICE_HOSTNAME = "sensor_camera"
 
 
 def env_float(name: str, default: float, min_value: float) -> float:
@@ -54,10 +38,10 @@ def env_float(name: str, default: float, min_value: float) -> float:
         print(f"[sensor_camera] | [Sensor Python:Config] {name}='{raw_value}' invalido. Usando {default}s.")
         return default
 
-    if value < min_value:
+    if not math.isfinite(value) or value < min_value:
         print(
-            f"[sensor_camera] | [Sensor Python:Config] {name}='{raw_value}' abaixo do minimo "
-            f"{min_value}s. Usando {default}s."
+            f"[sensor_camera] | [Sensor Python:Config] {name}='{raw_value}' deve ser finito "
+            f"e pelo menos {min_value}s. Usando {default}s."
         )
         return default
 
@@ -65,6 +49,9 @@ def env_float(name: str, default: float, min_value: float) -> float:
 
 
 MAX_FRAME_SIZE = 1024 * 1024
+MAX_COMMAND_ID_LENGTH = 128
+MIN_CONTROL_FREQUENCY_SECS = 1
+MAX_CONTROL_FREQUENCY_SECS = 60
 MAX_UDP_SEND_ATTEMPTS = 3
 BASE_RETRY_DELAY_SECS = 0.2
 MAX_RETRY_DELAY_SECS = 1.5
@@ -72,6 +59,14 @@ TELEMETRY_JITTER_SECS = 0.35
 DISCOVERY_PROBE_JITTER_SECS = 2.0
 HEARTBEAT_INTERVAL_SECS = env_float("SENSOR_HEARTBEAT_INTERVAL_SECS", 10.0, 1.0)
 HEARTBEAT_JITTER_SECS = env_float("SENSOR_HEARTBEAT_JITTER_SECS", 2.0, 0.0)
+CONTROL_COMMAND_MAX_AGE_SECS = env_float("CONTROL_COMMAND_MAX_AGE_SECS", 300.0, 1.0)
+CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS = env_float(
+    "CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS", 30.0, 0.0
+)
+COMMAND_REPLAY_WINDOW_SECS = (
+    CONTROL_COMMAND_MAX_AGE_SECS + CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS + 1.0
+)
+MAX_RECENT_COMMANDS = 4096
 MANUAL_OVERRIDE_SECS = 30.0
 THRESHOLD_SCAN_INTERVAL_SECS = 1.0
 THRESHOLD_EVENT_COOLDOWN_SECS = 3.0
@@ -80,9 +75,7 @@ TRAFFIC_INFRACTIONS_THRESHOLD = int(os.getenv("TRAFFIC_INFRACTIONS_THRESHOLD", "
 
 shutdown_event = threading.Event()
 state_lock = threading.Lock()
-
-best_aggregator_ip = GATEWAY_HOST
-best_aggregator_score = 999999.0
+_recent_commands: dict[str, float] = {}
 
 # Fila de probes de descoberta recebidos via multicast.
 # O multicast_listener_loop enfileira o instante monotônico em que a resposta
@@ -98,15 +91,6 @@ def build_device_fleet(count: int) -> dict[str, dict]:
         sector_name, sector_slug = SECTORS[idx % len(SECTORS)]
         sector_ordinal = (idx // len(SECTORS)) + 1
         device_id = f"camera_{sector_slug}_{sector_ordinal:02d}"
-        if sector_slug == "pici":
-            cx, cy = random.randint(0, 40), random.randint(0, 60)
-        elif sector_slug == "benfica":
-            cx, cy = random.randint(50, 90), random.randint(0, 30)
-        elif sector_slug == "porangabussu":
-            cx, cy = random.randint(60, 100), random.randint(50, 90)
-        else: # labomar
-            cx, cy = random.randint(0, 30), random.randint(70, 100)
-
         devices[device_id] = {
             "device_id": device_id,
             "sector": sector_name,
@@ -116,15 +100,11 @@ def build_device_fleet(count: int) -> dict[str, dict]:
             "next_threshold_check_at": 0.0,
             "last_threshold_send_at": 0.0,
             "manual_until": 0.0,
-            "coord_x": cx,
-            "coord_y": cy,
         }
     return devices
 
 
 DEVICES = build_device_fleet(CAMERA_DEVICE_COUNT)
-DEVICE_ID = next(iter(DEVICES))
-DEVICE_SECTOR = DEVICES[DEVICE_ID]["sector"]
 
 
 def status_name(status: int) -> str:
@@ -140,8 +120,8 @@ def random_device_status() -> int:
 
 
 def retry_delay_secs(attempt: int) -> float:
-    temp = min(MAX_RETRY_DELAY_SECS, BASE_RETRY_DELAY_SECS * (2 ** attempt))
-    return random.uniform(0, temp)
+    backoff = min(MAX_RETRY_DELAY_SECS, BASE_RETRY_DELAY_SECS * (2 ** attempt))
+    return backoff + random.uniform(0, BASE_RETRY_DELAY_SECS)
 
 
 def telemetry_wait_secs(frequency_secs: int) -> float:
@@ -160,14 +140,11 @@ def send_udp_message(message, port: int) -> None:
     data = message.SerializeToString()
     last_error = None
 
-    with state_lock:
-        target_ip = best_aggregator_ip
-
     for attempt in range(MAX_UDP_SEND_ATTEMPTS):
         try:
             with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
                 sock.settimeout(1.0)
-                sock.sendto(data, (target_ip, port))
+                sock.sendto(data, (GATEWAY_HOST, port))
             return
         except OSError as exc:
             last_error = exc
@@ -219,8 +196,6 @@ def send_discovery_response(target_device_id: str | None = None) -> None:
             control_port=CONTROL_TCP_PORT,
             initial_status=current_status,
             is_controllable=True,
-            coord_x=device["coord_x"],
-            coord_y=device["coord_y"],
         )
 
         try:
@@ -296,8 +271,6 @@ def emit_telemetry_payload(
         timestamp=int(time.time()),
         device_id=current_device_id,
         current_status=current_status,
-        coord_x=DEVICES[current_device_id]["coord_x"],
-        coord_y=DEVICES[current_device_id]["coord_y"],
     )
     payload.metrics.extend(metrics)
 
@@ -377,7 +350,109 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
+def validate_control_command(command) -> str | None:
+    command_id = command.command_id
+    if not command_id.strip():
+        return "command_id obrigatorio."
+    if len(command_id) > MAX_COMMAND_ID_LENGTH:
+        return f"command_id excede o limite de {MAX_COMMAND_ID_LENGTH} caracteres."
+
+    now = int(time.time())
+    if command.timestamp <= 0:
+        return "timestamp obrigatorio e deve usar Unix epoch em segundos."
+    if command.timestamp < now - CONTROL_COMMAND_MAX_AGE_SECS:
+        return f"timestamp expirado; idade maxima permitida: {CONTROL_COMMAND_MAX_AGE_SECS:.0f}s."
+    if command.timestamp > now + CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS:
+        return (
+            "timestamp esta no futuro alem da tolerancia de "
+            f"{CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS:.0f}s."
+        )
+
+    target_device_id = command.target_device_id
+    if not target_device_id.strip():
+        return "target_device_id obrigatorio."
+    if target_device_id not in DEVICES:
+        return f"dispositivo alvo desconhecido: {target_device_id}."
+
+    if not command.update_status and not command.update_frequency:
+        return "comando deve solicitar update_status e/ou update_frequency."
+
+    if command.update_status and command.target_status not in (
+        messages_pb2.STATUS_ON,
+        messages_pb2.STATUS_OFF,
+    ):
+        return "target_status invalido; apenas STATUS_ON e STATUS_OFF sao permitidos."
+
+    if command.update_frequency and not (
+        MIN_CONTROL_FREQUENCY_SECS
+        <= command.new_frequency_secs
+        <= MAX_CONTROL_FREQUENCY_SECS
+    ):
+        return (
+            "new_frequency_secs fora do intervalo permitido: "
+            f"{MIN_CONTROL_FREQUENCY_SECS} a {MAX_CONTROL_FREQUENCY_SECS}s."
+        )
+
+    return None
+
+
+def send_control_response(
+    conn: socket.socket,
+    command_id: str,
+    *,
+    success: bool,
+    message: str,
+    current_status: int = messages_pb2.STATUS_UNKNOWN,
+    current_frequency: int = 0,
+) -> None:
+    response = messages_pb2.ConfigResponse(
+        message_id=f"{'ACK' if success else 'ERR'}-{uuid.uuid4().hex[:8]}",
+        command_id=command_id,
+        timestamp=int(time.time()),
+        success=success,
+        message=message,
+        updated_status=current_status,
+        updated_frequency_secs=current_frequency,
+    )
+    response_bytes = response.SerializeToString()
+    conn.sendall(struct.pack(">I", len(response_bytes)) + response_bytes)
+
+
+def apply_control_command(command) -> tuple[dict | None, str | None]:
+    """Valida e aplica um comando uma vez, sob o mesmo lock do estado."""
+    validation_error = validate_control_command(command)
+    with state_lock:
+        device = DEVICES.get(command.target_device_id)
+        if validation_error:
+            return dict(device) if device else None, validation_error
+
+        now = time.monotonic()
+        expired_ids = [
+            command_id
+            for command_id, applied_at in _recent_commands.items()
+            if now - applied_at >= COMMAND_REPLAY_WINDOW_SECS
+        ]
+        for command_id in expired_ids:
+            del _recent_commands[command_id]
+
+        if command.command_id in _recent_commands:
+            return dict(device), "command_id ja processado."
+        if len(_recent_commands) >= MAX_RECENT_COMMANDS:
+            return dict(device), "limite de comandos recentes atingido; tente novamente mais tarde."
+
+        if command.update_status:
+            device["status"] = command.target_status
+            device["manual_until"] = now + MANUAL_OVERRIDE_SECS
+        if command.update_frequency:
+            device["frequency_secs"] = command.new_frequency_secs
+
+        device["next_send_at"] = 0.0
+        _recent_commands[command.command_id] = now
+        return dict(device), None
+
+
 def handle_control_client(conn: socket.socket, addr) -> None:
+    command_id = ""
     try:
         conn.settimeout(5.0)
 
@@ -387,104 +462,67 @@ def handle_control_client(conn: socket.socket, addr) -> None:
             raise ValueError(f"tamanho de frame invalido: {frame_size}")
 
         body = recv_exact(conn, frame_size)
-        if control_crypto.SECURE:
-            body = control_crypto.unwrap(body)
         command = messages_pb2.ConfigCommand()
         command.ParseFromString(body)
+        command_id = command.command_id
 
-        if control_crypto.SECURE:
-            ok, reason = _replay_guard.check(command.command_id, command.timestamp)
-            if not ok:
-                raise ValueError(f"comando rejeitado (anti-replay): {reason}")
+        target, validation_error = apply_control_command(command)
+        if validation_error:
+            current_status = messages_pb2.STATUS_UNKNOWN
+            current_frequency = 0
+            if target:
+                current_status = target["status"]
+                current_frequency = target["frequency_secs"]
 
-        target_device_id = command.target_device_id or DEVICE_ID
-        with state_lock:
-            device = DEVICES.get(target_device_id)
-            if not device:
-                raise ValueError(f"dispositivo alvo desconhecido: {target_device_id}")
+            print(
+                f"[sensor_camera] | [Sensor Python:TCP] Comando "
+                f"{command_id or '<sem-id>'} rejeitado: {validation_error}"
+            )
+            send_control_response(
+                conn,
+                command_id,
+                success=False,
+                message=f"Comando rejeitado pela camera: {validation_error}",
+                current_status=current_status,
+                current_frequency=current_frequency,
+            )
+            return
 
-            if command.update_status:
-                device["status"] = command.target_status
-                device["manual_until"] = time.monotonic() + MANUAL_OVERRIDE_SECS
-
-            if command.update_frequency and command.new_frequency_secs > 0:
-                device["frequency_secs"] = command.new_frequency_secs
-
-            device["next_send_at"] = 0.0
-            current_status = device["status"]
-            current_frequency = device["frequency_secs"]
-            sector = device["sector"]
+        target_device_id = command.target_device_id
+        current_status = target["status"]
+        current_frequency = target["frequency_secs"]
+        sector = target["sector"]
 
         print(
             f"[sensor_camera] | [Sensor Python:TCP] Comando {command.command_id or '<sem-id>'} recebido | "
             f"Dispositivo={target_device_id} | Setor={sector} | Status={status_name(current_status)} | Frequencia={current_frequency}s"
         )
 
-        response = messages_pb2.ConfigResponse(
-            message_id=f"ACK-{uuid.uuid4().hex[:8]}",
-            command_id=command.command_id,
-            timestamp=int(time.time()),
+        send_control_response(
+            conn,
+            command_id,
             success=True,
             message=f"Camera Python {target_device_id} reconfigurada com sucesso.",
-            updated_status=current_status,
-            updated_frequency_secs=current_frequency,
+            current_status=current_status,
+            current_frequency=current_frequency,
         )
-        response_bytes = response.SerializeToString()
-        if control_crypto.SECURE:
-            response_bytes = control_crypto.wrap(response_bytes)
-        conn.sendall(struct.pack(">I", len(response_bytes)) + response_bytes)
 
         send_discovery_response(target_device_id)
 
     except Exception as exc:
         print(f"[sensor_camera] | [Sensor Python:Erro] Falha no pipeline TCP: {exc}")
         try:
-            response = messages_pb2.ConfigResponse(
-                message_id=f"ERR-{uuid.uuid4().hex[:8]}",
-                timestamp=int(time.time()),
+            send_control_response(
+                conn,
+                command_id,
                 success=False,
                 message=f"Falha ao aplicar comando na camera: {exc}",
             )
-            response_bytes = response.SerializeToString()
-            if control_crypto.SECURE:
-                response_bytes = control_crypto.wrap(response_bytes)
-            conn.sendall(struct.pack(">I", len(response_bytes)) + response_bytes)
         except OSError:
             pass
     finally:
         conn.close()
 
-def authenticate_with_gateway() -> int:
-    print(f"[sensor_camera] | [Auth] Iniciando autenticacao TCP com Gateway ({GATEWAY_HOST}:{AUTH_TCP_PORT})...")
-    time.sleep(1.0)
-    
-    req = messages_pb2.AuthRequest()
-    req.device_id = DEVICE_ID
-    req.type = messages_pb2.DEVICE_TYPE_CAMERA
-    req.license_key_part = SENSOR_LICENSE_PART
-    req.hex_service_code = SENSOR_HEX_CODE
-    
-    payload = req.SerializeToString()
-    try:
-        with socket.create_connection((GATEWAY_HOST, AUTH_TCP_PORT), timeout=10) as sock:
-            sock.sendall(struct.pack("!I", len(payload)) + payload)
-            
-            raw_len = recv_exact(sock, 4)
-            msg_len = struct.unpack("!I", raw_len)[0]
-            resp_payload = recv_exact(sock, msg_len)
-            
-            resp = messages_pb2.AuthResponse()
-            resp.ParseFromString(resp_payload)
-            
-            if not resp.success:
-                print(f"[sensor_camera] | [Auth] FALHA na validacao: {resp.message}")
-                os._exit(1)
-                
-            print(f"[Auth] Gateway encontrado! Tipo: sensor_camera, Chave: '{SENSOR_LICENSE_PART}-{SENSOR_HEX_CODE}'. Validação: SUCESSO. Porta alocada e conectada: {resp.assigned_port}.")
-            return resp.assigned_port
-    except Exception as e:
-        print(f"[sensor_camera] | [Auth] Erro ao conectar/autenticar com Gateway: {e}")
-        os._exit(1)
 
 def control_server_loop() -> None:
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as server:
@@ -539,40 +577,24 @@ def multicast_listener_loop() -> None:
                     print(f"[sensor_camera] | [Sensor Python:Erro] Falha no multicast: {exc}")
                 continue
 
-            try:
-                loadMsg = messages_pb2.AggregatorLoad()
-                loadMsg.ParseFromString(data)
-                
-                if loadMsg.aggregator_id == "GATEWAY_PROBE":
-                    jitter = discovery_probe_jitter_secs()
-                    send_at = time.monotonic() + jitter
-                    try:
-                        # put_nowait garante que o listener nunca bloqueia.
-                        # Se a fila estiver cheia (rajada de probes), o probe é
-                        # descartado — o dispatch já tem respostas suficientes pendentes.
-                        _probe_dispatch_queue.put_nowait(send_at)
-                        print(
-                            f"[sensor_camera] | [Sensor Python:Multicast] Probe de {addr[0]} "
-                            f"enfileirado — resposta agendada em {jitter * 1000:.0f} ms "
-                            f"({_probe_dispatch_queue.qsize()} na fila)."
-                        )
-                    except queue.Full:
-                        print(
-                            f"[sensor_camera] | [Sensor Python:Multicast] Fila cheia "
-                            f"({_probe_dispatch_queue.maxsize} itens) — probe de {addr[0]} descartado."
-                        )
-                else:
-                    score = (loadMsg.cpu_load * 0.4) + (loadMsg.queue_size * 0.6)
-                    
-                    global best_aggregator_ip, best_aggregator_score
-                    with state_lock:
-                        if score < best_aggregator_score or best_aggregator_ip == loadMsg.ip_address:
-                            if best_aggregator_ip != loadMsg.ip_address:
-                                print(f"[sensor_camera] | [Sensor Python:LoadBalancer] Rota alterada para {loadMsg.aggregator_id} (Score: {best_aggregator_score:.2f} -> {score:.2f})")
-                                best_aggregator_ip = loadMsg.ip_address
-                            best_aggregator_score = score
-            except Exception as e:
-                pass
+            if data == b"SMARTCITY_DISCOVERY_PROBE":
+                jitter = discovery_probe_jitter_secs()
+                send_at = time.monotonic() + jitter
+                try:
+                    # put_nowait garante que o listener nunca bloqueia.
+                    # Se a fila estiver cheia (rajada de probes), o probe é
+                    # descartado — o dispatch já tem respostas suficientes pendentes.
+                    _probe_dispatch_queue.put_nowait(send_at)
+                    print(
+                        f"[sensor_camera] | [Sensor Python:Multicast] Probe de {addr[0]} "
+                        f"enfileirado — resposta agendada em {jitter * 1000:.0f} ms "
+                        f"({_probe_dispatch_queue.qsize()} na fila)."
+                    )
+                except queue.Full:
+                    print(
+                        f"[sensor_camera] | [Sensor Python:Multicast] Fila cheia "
+                        f"({_probe_dispatch_queue.maxsize} itens) — probe de {addr[0]} descartado."
+                    )
 
 
 def probe_dispatch_loop() -> None:
@@ -669,31 +691,10 @@ def main() -> None:
 
     threading.Thread(target=control_server_loop, daemon=True).start()
     threading.Thread(target=multicast_listener_loop, daemon=True).start()
-
-    print("[sensor_camera] | [Sensor Python] Aguardando broadcast de AggregatorLoad para descobrir IP real...")
-    while best_aggregator_ip == GATEWAY_HOST and not shutdown_event.is_set():
-        time.sleep(0.1)
-
-    send_discovery_response()
-    
-    assigned_port = authenticate_with_gateway()
-    global GATEWAY_TELEMETRY_PORT
-    GATEWAY_TELEMETRY_PORT = assigned_port
-    
-    time.sleep(2.0)
-
     threading.Thread(target=probe_dispatch_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
 
-    # Console IDLE embutido (opt-in via SENSOR_IDLE_CONSOLE). Conecta-se ao próprio
-    # servidor de controle local; requer terminal anexado (stdin_open + tty).
-    if os.getenv("SENSOR_IDLE_CONSOLE", "").strip().lower() in ("1", "true", "yes", "on"):
-        try:
-            import console
-            console.start_embedded(CONTROL_TCP_PORT)
-            print("[sensor_camera] | [IDLE] Console embutido ativo (use 'docker attach').")
-        except Exception as exc:
-            print(f"[sensor_camera] | [IDLE] Falha ao iniciar console embutido: {exc}")
+    send_discovery_response()
 
     while not shutdown_event.is_set():
         for device_id in threshold_due_device_ids():

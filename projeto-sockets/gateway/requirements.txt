@@ -1,2 +1,4 @@
+# Faixas compatíveis suportadas pelo gateway em Python 3.11.
+aiosqlite>=0.19.0,<1.0
+protobuf>=4.25.0,<7.0
 
-cryptography==42.0.5

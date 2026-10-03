@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import math
 import sqlite3
@@ -8,59 +7,25 @@ import struct
 import os
 import socket
 import uuid
-from contextlib import asynccontextmanager
+import signal
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Tuple
 
 # Biblioteca assíncrona para I/O não-bloqueante no SQLite
 import aiosqlite
-import redis.asyncio as redis
 from google.protobuf.message import DecodeError
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-def get_secret(name: str, default: str = "") -> str:
-    """Lê um segredo de <NAME>_FILE (Docker secret) e cai para a env var <NAME>.
-
-    Permite tirar segredos (chave AES, licença) do docker-compose em texto puro,
-    apontando, por exemplo, AES_SECRET_KEY_FILE=/run/secrets/aes_secret_key.
-    Mantém compatibilidade total: se *_FILE não existir, usa a env var de sempre.
-    """
-    file_path = os.getenv(name + "_FILE")
-    if file_path:
-        try:
-            with open(file_path, "r", encoding="utf-8") as fh:
-                return fh.read().strip()
-        except OSError as exc:
-            log_msg = f"[Config] Falha ao ler {name}_FILE='{file_path}': {exc}"
-            print(log_msg)
-    return os.getenv(name, default)
-
-
-_raw_key = get_secret("AES_SECRET_KEY", "SmartCityKey1234").encode("utf-8")
-AES_KEY = _raw_key.ljust(16, b'\x00')[:16]  # 16 bytes (AES-128)
-
-def decrypt_payload(raw_payload: bytes) -> bytes:
-    """Descriptografa o payload AES-128-GCM vindo do Redis."""
-    if len(raw_payload) < 28: # 12 nonce + pelo menos 1 byte + 16 tag
-        raise ValueError("Payload criptografado muito curto")
-    nonce = raw_payload[:12]
-    ciphertext = raw_payload[12:]
-    aesgcm = AESGCM(AES_KEY)
-    return aesgcm.decrypt(nonce, ciphertext, None)
-
-
-def encrypt_control(plaintext: bytes) -> bytes:
-    """Cifra um frame do canal de controle (nonce[12] || ciphertext+tag).
-
-    Mesmo esquema do pipeline de telemetria; usado quando CONTROL_SECURE=1 para
-    proteger o canal gateway↔sensor (confidencialidade + integridade via tag GCM).
-    """
-    nonce = os.urandom(12)
-    return nonce + AESGCM(AES_KEY).encrypt(nonce, plaintext, None)
-
-
-# Cifra/anti-replay do canal de controle (deve casar com o flag nos sensores).
-CONTROL_SECURE = os.getenv("CONTROL_SECURE", "0").strip().lower() in ("1", "true", "yes", "on")
+from analytics import (
+    OlapSource,
+    build_rollup_rows,
+    choose_retained_olap_source as select_olap_source,
+    graph_sampling_stride,
+    olap_time_range,
+    sample_stddev,
+    validate_time_window,
+)
 
 # ====================================================================
 # [M5] LOGGING CONFIGURÁVEL VIA ENV VAR
@@ -84,8 +49,6 @@ log = logging.getLogger("Gateway")
 # ====================================================================
 
 DB_DIR = "db"
-if not os.path.exists(DB_DIR):
-    os.makedirs(DB_DIR)
 
 DB_FILE            = os.path.join(DB_DIR, "smartcity_gateway.db")
 DB_POOL_SIZE       = max(1, int(os.getenv("DB_POOL_SIZE", "4")))
@@ -102,6 +65,10 @@ TELEMETRY_BATCH_FLUSH_INTERVAL_SECS = max(
     0.05,
     float(os.getenv("TELEMETRY_BATCH_FLUSH_INTERVAL_SECS", "1.0")),
 )
+TELEMETRY_SHUTDOWN_TIMEOUT_SECS = max(
+    0.1, float(os.getenv("TELEMETRY_SHUTDOWN_TIMEOUT_SECS", "20"))
+)
+DISCOVERY_MAX_IN_FLIGHT = max(1, int(os.getenv("DISCOVERY_MAX_IN_FLIGHT", "256")))
 
 METRICS_RAW_RETENTION_SECS = max(0, int(os.getenv("METRICS_RAW_RETENTION_SECS", str(7 * 24 * 3600))))
 ROLLUP_1M_RETENTION_SECS = max(0, int(os.getenv("ROLLUP_1M_RETENTION_SECS", str(30 * 24 * 3600))))
@@ -113,6 +80,8 @@ ROLLUP_BACKFILL_ON_STARTUP = os.getenv("ROLLUP_BACKFILL_ON_STARTUP", "1").lower(
 OLAP_RAW_MAX_WINDOW_SECS = max(60, int(os.getenv("OLAP_RAW_MAX_WINDOW_SECS", "3600")))
 OLAP_1M_MAX_WINDOW_SECS = max(OLAP_RAW_MAX_WINDOW_SECS, int(os.getenv("OLAP_1M_MAX_WINDOW_SECS", str(24 * 3600))))
 OLAP_5M_MAX_WINDOW_SECS = max(OLAP_1M_MAX_WINDOW_SECS, int(os.getenv("OLAP_5M_MAX_WINDOW_SECS", str(7 * 24 * 3600))))
+OLAP_MAX_QUERY_WINDOW_SECS = max(60, int(os.getenv("OLAP_MAX_QUERY_WINDOW_SECS", str(30 * 24 * 3600))))
+OLAP_MAX_GRAPH_POINTS = max(2, int(os.getenv("OLAP_MAX_GRAPH_POINTS", "2000")))
 
 ROLLUP_TABLES = (
     ("metrics_rollup_1m", 60, ROLLUP_1M_RETENTION_SECS),
@@ -123,24 +92,11 @@ ROLLUP_TABLES = (
 DB_POOL = None
 TELEMETRY_QUEUE: asyncio.Queue | None = None
 
-# Cliente Redis persistente para publicação (alertas / automação) — Fase B.
-REDIS_PUB = None
-
-# [Fase E] Observabilidade — contadores internos + endpoint Prometheus.
-PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", "9100"))
-GW_METRICS_PUBLISH_SECS = max(2, int(os.getenv("GW_METRICS_PUBLISH_SECS", "10")))
-_METRICS = {
-    "telemetry_payloads_total": 0,
-    "metrics_persisted_total": 0,
-    "alerts_total": 0,
-    "commands_total": 0,
-    "commands_failed_total": 0,
-}
-
-# Referências fortes para tasks UDP criadas via asyncio.create_task.
-# O event loop mantém apenas referências fracas; sem este set, o GC pode coletar
-# a task antes de ela concluir, descartando telemetria/descoberta silenciosamente.
+# Referências fortes para tasks assíncronas de descoberta, com limite explícito.
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
+_CLIENT_TASKS: set[asyncio.Task] = set()
+_TELEMETRY_DROPPED = 0
+_DISCOVERY_DROPPED = 0
 
 # Importa as classes do Protobuf geradas dinamicamente
 import messages_pb2  # pyright: ignore[reportMissingImports]
@@ -149,64 +105,9 @@ import messages_pb2  # pyright: ignore[reportMissingImports]
 # CONFIGURAÇÕES DE REDE
 # ====================================================================
 
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-
+UDP_TELEMETRY_PORT = 5000   # Porta dedicada exclusivamente à ingestão de dados
+UDP_DISCOVERY_PORT = 5002   # Porta dedicada exclusivamente aos handshakes de topologia
 TCP_PORT           = 5001
-AUTH_PORT          = 5007
-
-GATEWAY_LICENSE_KEY = get_secret("GATEWAY_LICENSE_KEY", "SMARTCITY-V1-FULL-LICENSE")
-MAX_AVAILABLE_PORTS = max(1, int(os.getenv("MAX_AVAILABLE_PORTS", "100")))
-MIN_DYNAMIC_PORT = 6000
-
-class InvalidLicenseKeyException(Exception): pass
-class InvalidHexServiceCodeException(Exception): pass
-class NoPortsAvailableException(Exception): pass
-
-import random
-_AVAILABLE_PORTS = set(range(MIN_DYNAMIC_PORT, MIN_DYNAMIC_PORT + MAX_AVAILABLE_PORTS))
-_LAST_ASSIGNED_PORT = 0
-
-# Conjunto de agregadores conhecidos. A porta dinâmica de um sensor é aberta em
-# TODOS eles, não apenas no que repassou o discovery — assim, se o load-balancer
-# do sensor migrar para outro agregador depois do auth, a telemetria continua
-# sendo recebida (a porta já está aberta lá). Semeado por env e enriquecido em
-# tempo de execução a partir do campo `aggregator` do discovery_stream.
-_KNOWN_AGGREGATORS: set[str] = {
-    agg.strip()
-    for agg in os.getenv("KNOWN_AGGREGATORS", "rust_tokio_1,java_netty_1").split(",")
-    if agg.strip()
-}
-
-# [Fase B+] Saúde de agregadores — última atividade (relay p/ Redis) por agregador.
-# Detecta agregador que parou de repassar dados e gera alerta de SISTEMA.
-AGG_HEALTH_TIMEOUT_SECS = max(5, int(os.getenv("AGG_HEALTH_TIMEOUT_SECS", "30")))
-AGG_HEALTH_CHECK_SECS = max(2, int(os.getenv("AGG_HEALTH_CHECK_SECS", "10")))
-_aggregator_last_seen: dict[str, int] = {}
-_aggregator_down: set[str] = set()
-_HEX_SERVICE_CODES = {
-    messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT: "0A",
-    messages_pb2.DEVICE_TYPE_LAMP_POST: "0B",
-    messages_pb2.DEVICE_TYPE_WEATHER_STATION: "0C",
-    messages_pb2.DEVICE_TYPE_CAMERA: "0D",
-    messages_pb2.DEVICE_TYPE_FLOOD: "0E",
-    messages_pb2.DEVICE_TYPE_NOISE: "0F",
-}
-
-def allocate_dynamic_port():
-    global _LAST_ASSIGNED_PORT
-    if not _AVAILABLE_PORTS:
-        raise NoPortsAvailableException("Nao ha portas disponiveis no Gateway")
-    candidates = list(_AVAILABLE_PORTS - {_LAST_ASSIGNED_PORT})
-    if not candidates:
-        if _LAST_ASSIGNED_PORT in _AVAILABLE_PORTS:
-            candidates = [_LAST_ASSIGNED_PORT]
-        else:
-            raise NoPortsAvailableException("Nao ha portas disponiveis no Gateway")
-    port = random.choice(candidates)
-    _AVAILABLE_PORTS.remove(port)
-    _LAST_ASSIGNED_PORT = port
-    return port
 
 # Timeout para leitura de cabeçalho e payload TCP do cliente (configurável)
 TCP_CLIENT_READ_TIMEOUT = max(5.0, float(os.getenv("TCP_CLIENT_READ_TIMEOUT", "10")))
@@ -215,6 +116,58 @@ TCP_CLIENT_IDLE_TIMEOUT = max(
     float(os.getenv("TCP_CLIENT_IDLE_TIMEOUT", "60")),
 )
 TCP_MAX_FRAME_BYTES = max(1024, int(os.getenv("TCP_MAX_FRAME_BYTES", str(1024 * 1024))))
+
+# Limites das fronteiras não autenticadas. São deliberadamente conservadores:
+# todos os payloads legítimos do simulador ficam muito abaixo destes valores.
+UDP_MAX_DATAGRAM_BYTES = min(
+    65507,
+    max(512, int(os.getenv("UDP_MAX_DATAGRAM_BYTES", str(16 * 1024)))),
+)
+MAX_DEVICE_ID_LENGTH = max(16, int(os.getenv("MAX_DEVICE_ID_LENGTH", "128")))
+MAX_MESSAGE_ID_LENGTH = max(16, int(os.getenv("MAX_MESSAGE_ID_LENGTH", "128")))
+MAX_METRIC_NAME_LENGTH = max(8, int(os.getenv("MAX_METRIC_NAME_LENGTH", "128")))
+MAX_METRIC_UNIT_LENGTH = max(4, int(os.getenv("MAX_METRIC_UNIT_LENGTH", "32")))
+MAX_METRICS_PER_PAYLOAD = max(1, int(os.getenv("MAX_METRICS_PER_PAYLOAD", "64")))
+MESSAGE_MAX_AGE_SECS = max(0, int(os.getenv("MESSAGE_MAX_AGE_SECS", str(24 * 3600))))
+MESSAGE_MAX_FUTURE_SKEW_SECS = max(
+    0,
+    int(os.getenv("MESSAGE_MAX_FUTURE_SKEW_SECS", "300")),
+)
+
+VALID_DEVICE_TYPES = frozenset(
+    {
+        messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT,
+        messages_pb2.DEVICE_TYPE_LAMP_POST,
+        messages_pb2.DEVICE_TYPE_WEATHER_STATION,
+        messages_pb2.DEVICE_TYPE_CAMERA,
+        messages_pb2.DEVICE_TYPE_AIR_QUALITY,
+        messages_pb2.DEVICE_TYPE_PARKING_SENSOR,
+    }
+)
+VALID_DEVICE_STATUSES = frozenset(
+    {
+        messages_pb2.STATUS_ON,
+        messages_pb2.STATUS_OFF,
+        messages_pb2.STATUS_ERROR,
+    }
+)
+VALID_COMMAND_STATUSES = frozenset(
+    {messages_pb2.STATUS_ON, messages_pb2.STATUS_OFF}
+)
+VALID_REQUEST_TYPES = frozenset(
+    {
+        messages_pb2.REQUEST_TYPE_LIST_DEVICES,
+        messages_pb2.REQUEST_TYPE_SEND_COMMAND,
+        messages_pb2.REQUEST_TYPE_ANALYTICS_QUERY,
+    }
+)
+VALID_QUERY_OPS = frozenset(
+    {
+        messages_pb2.OP_AVERAGE,
+        messages_pb2.OP_STD_DEV,
+        messages_pb2.OP_MAX_VARIATION,
+    }
+)
 
 MULTICAST_GROUP          = "239.0.0.1"
 MULTICAST_PORT           = 5005
@@ -244,6 +197,221 @@ class TelemetryEnvelope:
     timestamp: int
     status: int
     metrics: list[MetricSample]
+    message_id: str
+
+
+def validate_text_field(
+    value: str,
+    field_name: str,
+    max_length: int,
+    *,
+    required: bool = True,
+) -> str | None:
+    """Retorna uma descrição do erro ou ``None`` para texto canônico e limitado."""
+
+    stripped = value.strip()
+    if required and not stripped:
+        return f"{field_name} é obrigatório"
+    if len(stripped) > max_length:
+        return f"{field_name} excede {max_length} caracteres"
+    if value != stripped:
+        return f"{field_name} não pode começar ou terminar com espaços"
+    if any(ord(char) < 32 or ord(char) == 127 for char in stripped):
+        return f"{field_name} contém caracteres de controle"
+    return None
+
+
+def validate_ingress_timestamp(
+    timestamp: int,
+    field_name: str,
+    *,
+    now: int | None = None,
+) -> str | None:
+    """Valida timestamps recebidos contra os limites de replay e relógio futuro."""
+
+    current_time = int(time.time()) if now is None else int(now)
+    value = int(timestamp)
+    if value <= 0:
+        return f"{field_name} deve ser um Unix timestamp positivo"
+    if value > current_time + MESSAGE_MAX_FUTURE_SKEW_SECS:
+        return (
+            f"{field_name} está mais de {MESSAGE_MAX_FUTURE_SKEW_SECS}s no futuro"
+        )
+    if MESSAGE_MAX_AGE_SECS and value < current_time - MESSAGE_MAX_AGE_SECS:
+        return f"{field_name} excede a idade máxima de {MESSAGE_MAX_AGE_SECS}s"
+    return None
+
+
+def validate_telemetry_payload(
+    payload: messages_pb2.DataPayload,
+    *,
+    now: int | None = None,
+) -> str | None:
+    """Valida completamente um DataPayload antes de alocar trabalho assíncrono."""
+
+    error = validate_text_field(
+        payload.message_id, "message_id", MAX_MESSAGE_ID_LENGTH
+    )
+    if error:
+        return error
+    error = validate_text_field(
+        payload.device_id, "device_id", MAX_DEVICE_ID_LENGTH
+    )
+    if error:
+        return error
+    error = validate_ingress_timestamp(payload.timestamp, "timestamp", now=now)
+    if error:
+        return error
+    if int(payload.current_status) not in VALID_DEVICE_STATUSES:
+        return f"current_status inválido: {int(payload.current_status)}"
+    if len(payload.metrics) > MAX_METRICS_PER_PAYLOAD:
+        return (
+            f"payload contém {len(payload.metrics)} métricas; "
+            f"máximo permitido: {MAX_METRICS_PER_PAYLOAD}"
+        )
+
+    for index, metric in enumerate(payload.metrics):
+        error = validate_text_field(
+            metric.name,
+            f"metrics[{index}].name",
+            MAX_METRIC_NAME_LENGTH,
+        )
+        if error:
+            return error
+        error = validate_text_field(
+            metric.unit,
+            f"metrics[{index}].unit",
+            MAX_METRIC_UNIT_LENGTH,
+            required=False,
+        )
+        if error:
+            return error
+        if not math.isfinite(float(metric.value)):
+            return f"metrics[{index}].value deve ser finito"
+
+    return None
+
+
+def validate_discovery_payload(
+    discovery: messages_pb2.DiscoveryResponse,
+    *,
+    now: int | None = None,
+) -> str | None:
+    """Valida uma mensagem de descoberta antes de criar sua task de persistência."""
+
+    error = validate_text_field(
+        discovery.message_id, "message_id", MAX_MESSAGE_ID_LENGTH
+    )
+    if error:
+        return error
+    error = validate_text_field(
+        discovery.device_id, "device_id", MAX_DEVICE_ID_LENGTH
+    )
+    if error:
+        return error
+    error = validate_ingress_timestamp(discovery.timestamp, "timestamp", now=now)
+    if error:
+        return error
+    if int(discovery.type) not in VALID_DEVICE_TYPES:
+        return f"type inválido: {int(discovery.type)}"
+    if int(discovery.initial_status) not in VALID_DEVICE_STATUSES:
+        return f"initial_status inválido: {int(discovery.initial_status)}"
+    error = validate_text_field(
+        discovery.ip_address,
+        "ip_address",
+        255,
+        required=False,
+    )
+    if error:
+        return error
+    if discovery.is_controllable and not 1 <= discovery.control_port <= 65535:
+        return f"control_port inválida: {discovery.control_port}"
+    if not discovery.is_controllable and discovery.control_port not in (0,):
+        return "control_port deve ser zero para um dispositivo não controlável"
+    return None
+
+
+def validate_analytics_request(req: messages_pb2.ClientRequest) -> str | None:
+    error = validate_text_field(
+        req.query_metric, "query_metric", MAX_METRIC_NAME_LENGTH
+    )
+    if error:
+        return error
+    error = validate_text_field(
+        req.target_device_id,
+        "target_device_id",
+        MAX_DEVICE_ID_LENGTH,
+        required=False,
+    )
+    if error:
+        return error
+    if int(req.query_op) not in VALID_QUERY_OPS:
+        return f"query_op inválida: {int(req.query_op)}"
+    if req.start_timestamp <= 0 or req.end_timestamp <= 0:
+        return "start_timestamp e end_timestamp devem ser Unix timestamps positivos"
+    try:
+        validate_time_window(
+            int(req.start_timestamp),
+            int(req.end_timestamp),
+            OLAP_MAX_QUERY_WINDOW_SECS,
+        )
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def validate_command_request(req: messages_pb2.ClientRequest) -> str | None:
+    error = validate_text_field(
+        req.target_device_id, "target_device_id", MAX_DEVICE_ID_LENGTH
+    )
+    if error:
+        return error
+    if not req.HasField("command_payload"):
+        return "command_payload é obrigatório"
+
+    command = req.command_payload
+    error = validate_text_field(
+        command.command_id, "command_id", MAX_MESSAGE_ID_LENGTH
+    )
+    if error:
+        return error
+    error = validate_ingress_timestamp(command.timestamp, "command.timestamp")
+    if error:
+        return error
+    error = validate_text_field(
+        command.target_device_id,
+        "command.target_device_id",
+        MAX_DEVICE_ID_LENGTH,
+    )
+    if error:
+        return error
+    if command.target_device_id != req.target_device_id:
+        return "command.target_device_id diverge de target_device_id"
+    if not command.update_status and not command.update_frequency:
+        return "o comando deve solicitar ao menos uma alteração"
+    if command.update_status and int(command.target_status) not in VALID_COMMAND_STATUSES:
+        return f"target_status inválido: {int(command.target_status)}"
+    if command.update_frequency and not 1 <= command.new_frequency_secs <= 60:
+        return "new_frequency_secs deve estar entre 1 e 60"
+    return None
+
+
+def validate_client_request(req: messages_pb2.ClientRequest) -> str | None:
+    """Valida o envelope TCP e delega os campos específicos de cada rota."""
+
+    error = validate_text_field(req.message_id, "message_id", MAX_MESSAGE_ID_LENGTH)
+    if error:
+        return error
+    error = validate_ingress_timestamp(req.timestamp, "timestamp")
+    if error:
+        return error
+    if int(req.type) not in VALID_REQUEST_TYPES:
+        return f"type inválido: {int(req.type)}"
+    if req.type == messages_pb2.REQUEST_TYPE_SEND_COMMAND:
+        return validate_command_request(req)
+    if req.type == messages_pb2.REQUEST_TYPE_ANALYTICS_QUERY:
+        return validate_analytics_request(req)
+    return None
 
 
 class SQLiteConnectionPool:
@@ -280,8 +448,8 @@ class SQLiteConnectionPool:
         db = await self._queue.get()
         try:
             yield db
-        except Exception:
-           
+        except BaseException:
+
             try:
                 await db.rollback()
             except Exception as rollback_exc:
@@ -388,6 +556,7 @@ def backfill_rollup_tables(cursor: sqlite3.Cursor):
 
 def init_db():
     """Inicialização síncrona executada apenas no boot do Gateway."""
+    os.makedirs(DB_DIR, exist_ok=True)
     conn   = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
@@ -402,27 +571,9 @@ def init_db():
             ip_address   TEXT,
             control_port INTEGER,
             is_controllable INTEGER,
-            last_seen    INTEGER,
-            aggregator_id TEXT,
-            coord_x      INTEGER,
-            coord_y      INTEGER
+            last_seen    INTEGER
         )
     """)
-    # Migration if table already exists
-    try:
-        cursor.execute("ALTER TABLE devices ADD COLUMN aggregator_id TEXT")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    try:
-        cursor.execute("ALTER TABLE devices ADD COLUMN coord_x INTEGER")
-        cursor.execute("ALTER TABLE devices ADD COLUMN coord_y INTEGER")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    try:
-        cursor.execute("ALTER TABLE devices ADD COLUMN telemetry_port INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_devices_last_seen
         ON devices (last_seen)
@@ -437,29 +588,26 @@ def init_db():
             unit        TEXT
         )
     """)
-    # [Fase B+] Histórico durável de alertas (além do stream Redis efêmero).
+    ensure_metrics_index(cursor)
+    ensure_rollup_tables(cursor)
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS alerts_history (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp   INTEGER,
-            device_id   TEXT,
-            metric      TEXT,
-            value       REAL,
-            threshold   REAL,
-            op          TEXT,
-            severity    TEXT,
-            message     TEXT
+        CREATE TABLE IF NOT EXISTS telemetry_messages (
+            device_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            PRIMARY KEY (device_id, message_id)
         )
     """)
     cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_alerts_time ON alerts_history (timestamp)
+        CREATE INDEX IF NOT EXISTS idx_telemetry_messages_timestamp
+        ON telemetry_messages (timestamp)
     """)
     cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_alerts_device ON alerts_history (device_id, timestamp)
+        CREATE TABLE IF NOT EXISTS telemetry_state (
+            device_id TEXT PRIMARY KEY,
+            last_timestamp INTEGER NOT NULL
+        )
     """)
-
-    ensure_metrics_index(cursor)
-    ensure_rollup_tables(cursor)
     backfill_rollup_tables(cursor)
     conn.commit()
     conn.close()
@@ -484,53 +632,8 @@ def build_telemetry_envelope(payload: messages_pb2.DataPayload, ip: str) -> Tele
             )
             for m in payload.metrics
         ],
+        message_id=payload.message_id,
     )
-
-
-def build_rollup_rows(metric_rows: list[tuple[str, int, str, float, str]]):
-    rollup_rows: dict[str, list[tuple[int, str, str, str, int, float, float, float, float]]] = {}
-
-    for table_name, bucket_size, _ in ROLLUP_TABLES:
-        aggregated: dict[tuple[int, str, str], dict[str, float | int | str]] = {}
-
-        for device_id, timestamp, metric_name, value, unit in metric_rows:
-            bucket_start = (int(timestamp) // bucket_size) * bucket_size
-            key = (bucket_start, device_id, metric_name)
-            current = aggregated.get(key)
-
-            if current is None:
-                aggregated[key] = {
-                    "unit": unit,
-                    "sample_count": 1,
-                    "value_sum": value,
-                    "value_sum_sq": value * value,
-                    "value_min": value,
-                    "value_max": value,
-                }
-            else:
-                current["unit"] = unit or current["unit"]
-                current["sample_count"] = int(current["sample_count"]) + 1
-                current["value_sum"] = float(current["value_sum"]) + value
-                current["value_sum_sq"] = float(current["value_sum_sq"]) + (value * value)
-                current["value_min"] = min(float(current["value_min"]), value)
-                current["value_max"] = max(float(current["value_max"]), value)
-
-        rollup_rows[table_name] = [
-            (
-                bucket_start,
-                device_id,
-                metric_name,
-                str(values["unit"]),
-                int(values["sample_count"]),
-                float(values["value_sum"]),
-                float(values["value_sum_sq"]),
-                float(values["value_min"]),
-                float(values["value_max"]),
-            )
-            for (bucket_start, device_id, metric_name), values in aggregated.items()
-        ]
-
-    return rollup_rows
 
 
 async def persist_telemetry_batch(batch: list[TelemetryEnvelope]):
@@ -538,28 +641,41 @@ async def persist_telemetry_batch(batch: list[TelemetryEnvelope]):
         return
 
     now = int(time.time())
-    device_updates = {
-        # control_port=0 incluído explicitamente para evitar NULL quando
-        # a telemetria chega antes da mensagem de descoberta (race condition de rede).
-        # INSERT OR IGNORE garante que uma descoberta posterior sobrescreva via
-        # process_discovery (ON CONFLICT DO UPDATE com o valor real da porta).
-        envelope.device_id: (envelope.device_id, 0, envelope.status, envelope.ip, 0, 0, now)
-        for envelope in batch
-    }
-    device_update_rows = [(now, row[2], row[0]) for row in device_updates.values()]
-    metric_rows = [
-        (
-            sample.device_id,
-            sample.timestamp,
-            sample.metric_name,
-            sample.value,
-            sample.unit,
-        )
-        for envelope in batch
-        for sample in envelope.metrics
-    ]
-
     async with get_db_pool().connection() as db:
+        # A identidade e os dados precisam ser confirmados juntos. BEGIN IMMEDIATE
+        # também impede que duas conexões aceitem a mesma mensagem simultaneamente.
+        await db.execute("BEGIN IMMEDIATE")
+        accepted = []
+        for envelope in batch:
+            async with db.execute("""
+                INSERT OR IGNORE INTO telemetry_messages (device_id, message_id, timestamp)
+                SELECT ?, ?, ?
+                WHERE ? >= COALESCE(
+                    (SELECT last_timestamp FROM telemetry_state WHERE device_id = ?), 0
+                )
+            """, (envelope.device_id, envelope.message_id, envelope.timestamp,
+                  envelope.timestamp, envelope.device_id)) as cursor:
+                inserted = cursor.rowcount
+            if not inserted:
+                continue
+            accepted.append(envelope)
+            await db.execute("""
+                INSERT INTO telemetry_state (device_id, last_timestamp) VALUES (?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET last_timestamp = excluded.last_timestamp
+            """, (envelope.device_id, envelope.timestamp))
+
+        # A telemetria pode preceder a descoberta. O registro inicial não apaga
+        # capacidades de controle já anunciadas por um dispositivo existente.
+        device_updates = {
+            envelope.device_id: (envelope.device_id, 0, envelope.status, envelope.ip, 0, 0, now)
+            for envelope in accepted
+        }
+        device_update_rows = [(now, row[2], row[0]) for row in device_updates.values()]
+        metric_rows = [
+            (sample.device_id, sample.timestamp, sample.metric_name, sample.value, sample.unit)
+            for envelope in accepted
+            for sample in envelope.metrics
+        ]
         await db.executemany("""
             INSERT OR IGNORE INTO devices (device_id, type, status, ip_address, control_port, is_controllable, last_seen)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -575,7 +691,7 @@ async def persist_telemetry_batch(batch: list[TelemetryEnvelope]):
                 VALUES (?, ?, ?, ?, ?)
             """, metric_rows)
 
-            for table_name, rows in build_rollup_rows(metric_rows).items():
+            for table_name, rows in build_rollup_rows(metric_rows, ROLLUP_TABLES).items():
                 if not rows:
                     continue
                 await db.executemany(f"""
@@ -594,157 +710,33 @@ async def persist_telemetry_batch(batch: list[TelemetryEnvelope]):
 
         await db.commit()
 
-    _METRICS["telemetry_payloads_total"] += len(batch)
-    _METRICS["metrics_persisted_total"] += len(metric_rows)
-
     log.debug(
         "Batch de telemetria persistido: %d payload(s), %d métrica(s).",
         len(batch), len(metric_rows),
     )
 
 
-async def process_telemetry(payload: messages_pb2.DataPayload, ip: str):
-    """Enfileira telemetria para persistência em lote sem travar o Event Loop."""
+def enqueue_telemetry(payload: messages_pb2.DataPayload, ip: str) -> bool:
+    """Enfileira sem bloquear e aplica backpressure descartando sobrecarga."""
+    global _TELEMETRY_DROPPED
+
     envelope = build_telemetry_envelope(payload, ip)
-    await get_telemetry_queue().put(envelope)
+    queue = get_telemetry_queue()
 
-
-# ====================================================================
-# [FASE B] ALERTAS EM TEMPO REAL
-#   Avalia cada métrica contra limiares; ao romper (com cooldown por
-#   device+métrica), publica no stream Redis 'alerts' e dispara webhook.
-# ====================================================================
-
-ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "").strip()
-ALERT_COOLDOWN_SECS = max(1, int(os.getenv("ALERT_COOLDOWN_SECS", "60")))
-
-# (métrica, operador, limiar, severidade)
-ALERT_THRESHOLDS = (
-    ("temperature",       ">=",   32.0, "warning"),
-    ("pm25",              ">=",   35.0, "warning"),
-    ("aqi",               ">=",  100.0, "warning"),
-    ("co2",               ">=", 1200.0, "warning"),
-    ("queue_length",      ">=",   35.0, "warning"),
-    ("power_consumption", ">=",   32.0, "warning"),
-    ("luminosity",        "<=",   80.0, "info"),
-    ("vehicles_count",    ">=",   80.0, "warning"),
-    ("infractions",       ">=",    3.0, "critical"),
-    ("water_level",       ">=",  150.0, "critical"),   # enchente (cm)
-    ("noise_db",          ">=",   85.0, "warning"),    # ruído (dB)
-)
-
-_alert_last_fired: dict[tuple[str, str], int] = {}
-
-# Silenciamentos ativos: "device_id|metric" -> epoch de expiração.
-# Recarregados do hash Redis 'alert_silences' (editável pela UI / ack de alertas).
-ALERT_SILENCES: dict[str, int] = {}
-
-
-def _threshold_breached(op: str, value: float, threshold: float) -> bool:
-    if op == ">=":
-        return value >= threshold
-    if op == "<=":
-        return value <= threshold
-    if op == ">":
-        return value > threshold
-    if op == "<":
-        return value < threshold
-    return False
-
-
-def _post_webhook_blocking(url: str, payload: dict):
-    import urllib.request
     try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5).close()
-    except Exception as exc:  # noqa: BLE001 — webhook é best-effort
-        log.debug("Webhook de alerta falhou: %s", exc)
-
-
-def dispatch_alert_webhook(alert: dict):
-    if not ALERT_WEBHOOK_URL:
-        return
-    text = f"[{alert['severity'].upper()}] {alert['device_id']}: {alert['message']}"
-    # 'content' (Discord) e 'text' (Slack) p/ compatibilidade ampla.
-    payload = {"content": text, "text": text, **alert}
-    asyncio.get_running_loop().run_in_executor(None, _post_webhook_blocking, ALERT_WEBHOOK_URL, payload)
-
-
-async def _publish_alert(alert: dict):
-    """Publica um alerta no stream Redis e dispara o webhook (best-effort)."""
-    if REDIS_PUB is not None:
-        try:
-            await REDIS_PUB.xadd("alerts", alert, maxlen=5000, approximate=True)
-        except Exception as exc:
-            log.debug("Falha ao publicar alerta no Redis: %s", exc)
-    dispatch_alert_webhook(alert)
-
-
-async def insert_alert_history(alerts: list[dict]):
-    """Persiste alertas na tabela durável alerts_history (para análise futura)."""
-    if not alerts:
-        return
-    rows = []
-    for a in alerts:
-        try:
-            rows.append((
-                int(a.get("ts", 0) or 0), a.get("device_id", ""), a.get("metric", ""),
-                float(a.get("value", 0) or 0), float(a.get("threshold", 0) or 0),
-                a.get("op", ""), a.get("severity", ""), a.get("message", ""),
-            ))
-        except (TypeError, ValueError):
-            continue
-    try:
-        async with get_db_pool().connection() as db:
-            await db.executemany(
-                "INSERT INTO alerts_history "
-                "(timestamp, device_id, metric, value, threshold, op, severity, message) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows,
+        queue.put_nowait(envelope)
+    except asyncio.QueueFull:
+        _TELEMETRY_DROPPED += 1
+        if _TELEMETRY_DROPPED == 1 or _TELEMETRY_DROPPED % 100 == 0:
+            log.warning(
+                "Fila de telemetria saturada; %d pacote(s) descartado(s) "
+                "para preservar a memória (limite=%d).",
+                _TELEMETRY_DROPPED,
+                TELEMETRY_QUEUE_MAXSIZE,
             )
-            await db.commit()
-    except Exception as exc:
-        log.debug("Falha ao gravar histórico de alertas: %s", exc)
+        return False
 
-
-def _is_silenced(device_id: str, metric: str, now: int) -> bool:
-    return ALERT_SILENCES.get(f"{device_id}|{metric}", 0) > now
-
-
-async def evaluate_alerts(batch: list[TelemetryEnvelope]):
-    """Verifica limiares de um batch e publica alertas (stream + webhook + histórico)."""
-    if REDIS_PUB is None:
-        return
-    now = int(time.time())
-    fired: list[dict] = []
-    for envelope in batch:
-        for sample in envelope.metrics:
-            for metric, op, threshold, severity in ALERT_THRESHOLDS:
-                if sample.metric_name != metric:
-                    continue
-                if not _threshold_breached(op, sample.value, threshold):
-                    continue
-                if _is_silenced(sample.device_id, metric, now):
-                    continue
-                key = (sample.device_id, metric)
-                if now - _alert_last_fired.get(key, 0) < ALERT_COOLDOWN_SECS:
-                    continue
-                _alert_last_fired[key] = now
-                alert = {
-                    "ts": str(now),
-                    "device_id": sample.device_id,
-                    "metric": metric,
-                    "value": f"{sample.value:.2f}",
-                    "threshold": str(threshold),
-                    "op": op,
-                    "severity": severity,
-                    "message": f"{metric}={sample.value:.1f} {op} {threshold:g}",
-                }
-                await _publish_alert(alert)
-                fired.append(alert)
-                log.info("ALERTA [%s] %s: %s", severity, sample.device_id, alert["message"])
-    _METRICS["alerts_total"] += len(fired)
-    await insert_alert_history(fired)
+    return True
 
 
 async def telemetry_batch_worker_loop():
@@ -775,20 +767,23 @@ async def telemetry_batch_worker_loop():
                 batch.append(item)
                 metric_rows += len(item.metrics)
 
-            await persist_telemetry_batch(batch)
-            await evaluate_alerts(batch)
-            await evaluate_automation(batch)
+            retry_delay = 0.25
+            while True:
+                try:
+                    await persist_telemetry_batch(batch)
+                    break
+                except Exception as exc:
+                    # Manter o lote local evita perder pacotes admitidos durante
+                    # falhas transitórias; a fila continua limitada por backpressure.
+                    log.warning("Falha ao persistir telemetria; repetindo em %.2fs: %s",
+                                retry_delay, exc)
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(5.0, retry_delay * 2)
         except asyncio.CancelledError:
             if batch:
                 await persist_telemetry_batch(batch)
-                for _ in batch:
-                    queue.task_done()
             raise
-        except Exception as exc:
-            log.warning("Falha no worker de batch de telemetria: %s", exc)
-            for _ in batch:
-                queue.task_done()
-        else:
+        finally:
             for _ in batch:
                 queue.task_done()
 
@@ -797,120 +792,160 @@ async def process_discovery(disc: messages_pb2.DiscoveryResponse, ip: str):
     """Registra ou renova a presença de nós operacionais assincronamente."""
     now = int(time.time())
 
-    announced = disc.ip_address.strip() if disc.ip_address else ""
-    effective_ip = announced if announced else ip
+    device_id = disc.device_id.strip()
+    announced = disc.ip_address.strip()[:255] if disc.ip_address else ""
+
+    if not device_id or len(device_id) > 128:
+        log.warning("Descoberta rejeitada de %s: device_id ausente ou longo demais.", ip)
+        return
+
+    if disc.is_controllable and not 1 <= disc.control_port <= 65535:
+        log.warning(
+            "Descoberta rejeitada de %s para '%s': porta de controle inválida (%d).",
+            ip, device_id, disc.control_port,
+        )
+        return
+
+    # O endereço declarado é dado não confiável. Usar a origem do datagrama evita
+    # que uma descoberta induza o gateway a abrir conexão para um terceiro host.
+    effective_ip = ip
+    control_port = disc.control_port if disc.is_controllable else 0
 
     async with get_db_pool().connection() as db:
         async with db.execute(
             "SELECT 1 FROM devices WHERE device_id = ?",
-            (disc.device_id,),
+            (device_id,),
         ) as cursor:
             existing_device = await cursor.fetchone()
 
         await db.execute("""
             INSERT INTO devices
-            (device_id, type, status, ip_address, control_port, is_controllable, last_seen, aggregator_id, coord_x, coord_y)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (device_id, type, status, ip_address, control_port, is_controllable, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 type            = excluded.type,
                 status          = excluded.status,
                 ip_address      = excluded.ip_address,
                 control_port    = excluded.control_port,
                 is_controllable = excluded.is_controllable,
-                last_seen       = excluded.last_seen,
-                aggregator_id   = excluded.aggregator_id,
-                coord_x         = excluded.coord_x,
-                coord_y         = excluded.coord_y
-        """, (disc.device_id, disc.type, disc.initial_status, effective_ip,
-              disc.control_port, int(disc.is_controllable), now, disc.aggregator_id, disc.coord_x, disc.coord_y))
+                last_seen       = excluded.last_seen
+        """, (device_id, disc.type, disc.initial_status, effective_ip,
+              control_port, int(disc.is_controllable), now))
         await db.commit()
 
     if existing_device is None:
         log.info(
             "Nó registrado: '%s' — rede=%s anunciado='%s' porta=%d (controlável=%s).",
-            disc.device_id, ip, announced or "<não informado>",
-            disc.control_port, disc.is_controllable,
+            device_id, ip, announced or "<não informado>",
+            control_port, disc.is_controllable,
         )
     else:
         log.debug(
             "Heartbeat/topologia renovado: '%s' — rede=%s anunciado='%s' porta=%d.",
-            disc.device_id, ip, announced or "<não informado>", disc.control_port,
+            device_id, ip, announced or "<não informado>", control_port,
         )
 
 
-async def redis_telemetry_loop():
-    """Consome a stream de telemetria do Redis de forma contínua."""
-    log.info("Iniciando consumo de telemetria via Redis Stream...")
-    client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
-    # "$" = apenas mensagens novas. Evita reprocessar todo o histórico a cada
-    # reinício do Gateway (o que duplicaria métricas, pois o INSERT em `metrics`
-    # não é idempotente e os rollups somam via ON CONFLICT).
-    last_id = "$"
-    try:
-        while True:
-            try:
-                events = await client.xread({"telemetry_stream": last_id}, count=100, block=1000)
-                for stream, messages in events:
-                    for msg_id, data in messages:
-                        last_id = msg_id
-                        raw_payload = data[b'payload']
-                        agg = data.get(b'aggregator', b'').decode('utf-8')
-                        if agg:
-                            _aggregator_last_seen[agg] = int(time.time())
-                            _KNOWN_AGGREGATORS.add(agg)
-                        try:
-                            decrypted = decrypt_payload(raw_payload)
-                            payload = messages_pb2.DataPayload()
-                            payload.ParseFromString(decrypted)
-                            task = asyncio.create_task(process_telemetry(payload, "0.0.0.0"))
-                            _BACKGROUND_TASKS.add(task)
-                            task.add_done_callback(_BACKGROUND_TASKS.discard)
-                        except Exception as e:
-                            log.debug("Datagrama de telemetria inválido do Redis: %s", e)
-            except Exception as e:
-                log.error("Erro ao ler telemetry_stream: %s", e)
-                await asyncio.sleep(2)
-    except asyncio.CancelledError:
-        await client.close()
-        raise
+# ====================================================================
+# CAMADA DE REDE: INGESTÃO E DESCOBERTA (MULTIPLEXAÇÃO FÍSICA UDP)
+# ====================================================================
+
+class TelemetryUDPProtocol(asyncio.DatagramProtocol):
+    """Protocolo de transporte focado estritamente na ingestão contínua (Porta 5000)."""
+
+    def connection_made(self, transport):
+        self.transport = transport
+        log.info("Interface de Telemetria ativa na porta %d.", UDP_TELEMETRY_PORT)
+
+    def datagram_received(self, data: bytes, addr: Tuple[str, int]):
+        """Decodifica estritamente fluxos operacionais DataPayload."""
+
+        if not data or len(data) > UDP_MAX_DATAGRAM_BYTES:
+            log.warning(
+                "Datagrama de telemetria rejeitado de %s: %d bytes (limite=%d).",
+                addr,
+                len(data),
+                UDP_MAX_DATAGRAM_BYTES,
+            )
+            return
+
+        # Tenta extrair datagramas de Telemetria (Métricas Físicas)
+        try:
+            payload = messages_pb2.DataPayload()
+            payload.ParseFromString(data)
+
+            validation_error = validate_telemetry_payload(payload)
+            if validation_error:
+                log.debug(
+                    "Telemetria rejeitada de %s: %s.", addr, validation_error
+                )
+                return
+
+            # A fila limitada é a fronteira de backpressure. Não criamos uma
+            # task por datagrama, pois tasks bloqueadas também consumiriam
+            # memória quando o SQLite não acompanhasse a taxa de entrada.
+            if not enqueue_telemetry(payload, addr[0]):
+                return
+
+            # A deduplicação acontece na transação de persistência, inclusive
+            # após reinicialização e depois de uma falha de escrita.
+            log.debug(
+                "Pacote ID [%s] de '%s' — atraso %ds.",
+                payload.message_id, payload.device_id,
+                int(time.time()) - payload.timestamp,
+            )
+            return
+        except Exception as exc:
+            log.debug("Datagrama de telemetria inválido de %s: %s", addr, exc)
 
 
-async def redis_discovery_loop():
-    """Consome a stream de descoberta do Redis."""
-    log.info("Iniciando consumo de discovery via Redis Stream...")
-    client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
-    # "$" = apenas mensagens novas. Reprocessar descobertas antigas no restart
-    # marcaria nós já desligados como recém-vistos (last_seen = agora).
-    last_id = "$"
-    try:
-        while True:
-            try:
-                events = await client.xread({"discovery_stream": last_id}, count=100, block=1000)
-                for stream, messages in events:
-                    for msg_id, data in messages:
-                        last_id = msg_id
-                        raw_payload = data[b'payload']
-                        aggregator_id = data.get(b'aggregator', b'').decode('utf-8')
-                        try:
-                            decrypted = decrypt_payload(raw_payload)
-                            disc = messages_pb2.DiscoveryResponse()
-                            disc.ParseFromString(decrypted)
-                            if aggregator_id:
-                                disc.aggregator_id = aggregator_id
-                                _KNOWN_AGGREGATORS.add(aggregator_id)
-                                _aggregator_last_seen[aggregator_id] = int(time.time())
-                            if disc.device_id:
-                                task = asyncio.create_task(process_discovery(disc, "0.0.0.0"))
-                                _BACKGROUND_TASKS.add(task)
-                                task.add_done_callback(_BACKGROUND_TASKS.discard)
-                        except Exception as e:
-                            log.debug("Datagrama de descoberta inválido do Redis: %s", e)
-            except Exception as e:
-                log.error("Erro ao ler discovery_stream: %s", e)
-                await asyncio.sleep(2)
-    except asyncio.CancelledError:
-        await client.close()
-        raise
+class DiscoveryUDPProtocol(asyncio.DatagramProtocol):
+    """Protocolo de transporte focado no registro de topologia (Porta 5002)."""
+
+    def connection_made(self, transport):
+        self.transport = transport
+        log.info("Interface de Descoberta ativa na porta %d.", UDP_DISCOVERY_PORT)
+
+    def datagram_received(self, data: bytes, addr: Tuple[str, int]):
+        """Decodifica estritamente fluxos de handshake e heartbeat."""
+        global _DISCOVERY_DROPPED
+
+        if not data or len(data) > UDP_MAX_DATAGRAM_BYTES:
+            log.warning(
+                "Datagrama de descoberta rejeitado de %s: %d bytes (limite=%d).",
+                addr,
+                len(data),
+                UDP_MAX_DATAGRAM_BYTES,
+            )
+            return
+
+        try:
+            disc = messages_pb2.DiscoveryResponse()
+            disc.ParseFromString(data)
+
+            validation_error = validate_discovery_payload(disc)
+            if validation_error:
+                log.debug(
+                    "Descoberta rejeitada de %s: %s.", addr, validation_error
+                )
+                return
+
+            if len(_BACKGROUND_TASKS) >= DISCOVERY_MAX_IN_FLIGHT:
+                _DISCOVERY_DROPPED += 1
+                if _DISCOVERY_DROPPED == 1 or _DISCOVERY_DROPPED % 100 == 0:
+                    log.warning(
+                        "Limite de descobertas concorrentes atingido; "
+                        "%d pacote(s) descartado(s) (limite=%d).",
+                        _DISCOVERY_DROPPED,
+                        DISCOVERY_MAX_IN_FLIGHT,
+                    )
+                return
+
+            task = asyncio.create_task(process_discovery(disc, addr[0]))
+            _BACKGROUND_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_TASKS.discard)
+        except Exception as e:
+            log.error("Falha na decodificação de datagrama de Descoberta %s: %s", addr, e)
 
 
 async def multicast_discovery_probe_loop():
@@ -923,9 +958,7 @@ async def multicast_discovery_probe_loop():
 
             while True:
                 try:
-                    probe = messages_pb2.AggregatorLoad()
-                    probe.aggregator_id = "GATEWAY_PROBE"
-                    sock.sendto(probe.SerializeToString(), (MULTICAST_GROUP, MULTICAST_PORT))
+                    sock.sendto(DISCOVERY_PROBE_PAYLOAD, (MULTICAST_GROUP, MULTICAST_PORT))
                     log.debug(
                         "Probe de descoberta enviado para %s:%d.",
                         MULTICAST_GROUP, MULTICAST_PORT,
@@ -973,36 +1006,14 @@ async def device_offline_monitor_loop():
             # conexão ainda está checada para uso. Acessá-lo após o bloco é frágil
             # pois a conexão pode ser reutilizada por outra corrotina.
             marked_offline = 0
-            offline_devices = []
             async with get_db_pool().connection() as db:
                 cursor = await db.execute("""
-                    SELECT aggregator_id, telemetry_port FROM devices
-                    WHERE last_seen < ? AND status != ? AND telemetry_port > 0
-                """, (cutoff, messages_pb2.STATUS_OFF))
-                offline_devices = await cursor.fetchall()
-                
-                cursor = await db.execute("""
                     UPDATE devices
-                    SET status = ?, telemetry_port = 0
+                    SET status = ?
                     WHERE last_seen < ? AND status != ?
                 """, (messages_pb2.STATUS_OFF, cutoff, messages_pb2.STATUS_OFF))
                 await db.commit()
                 marked_offline = cursor.rowcount
-
-            if offline_devices:
-                try:
-                    client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
-                    for agg_id, port in offline_devices:
-                        if MIN_DYNAMIC_PORT <= port < (MIN_DYNAMIC_PORT + MAX_AVAILABLE_PORTS):
-                            _AVAILABLE_PORTS.add(port)
-                            # A porta foi aberta em todos os agregadores no auth;
-                            # fecha em todos eles (∪ o do device) para não vazar sockets.
-                            for agg in set(_KNOWN_AGGREGATORS) | ({agg_id} if agg_id else set()):
-                                await client.lpush(f"agg_control_{agg}", f"FECHAR_PORTA_UDP: {port}")
-                    await client.close()
-                    log.info("Liberadas %d porta(s) UDP de dispositivos offline.", len(offline_devices))
-                except Exception as e:
-                    log.error("Erro ao publicar FECHAR_PORTA_UDP no Redis: %s", e)
 
             if marked_offline > 0:
                 log.warning(
@@ -1015,53 +1026,6 @@ async def device_offline_monitor_loop():
             log.warning("Falha no monitor de presença dos dispositivos: %s", exc)
 
         await asyncio.sleep(DEVICE_OFFLINE_CHECK_INTERVAL_SECS)
-
-
-async def aggregator_health_loop():
-    """Auto-alerta de saúde: emite alerta de SISTEMA quando um agregador para de
-    repassar dados ao Redis (e um alerta de recuperação quando volta).
-
-    Sinal baseado na atividade de relay (precursor do ACK two-way da Fase E);
-    um agregador up porém ocioso pode aparecer como inativo — por isso só alerta
-    em transições e com timeout generoso.
-    """
-    await asyncio.sleep(AGG_HEALTH_CHECK_SECS)
-    while True:
-        try:
-            now = int(time.time())
-            for agg in sorted(_KNOWN_AGGREGATORS):
-                last = _aggregator_last_seen.get(agg, 0)
-                if last == 0:
-                    continue  # nunca repassou nada ainda — não alarmar no boot
-                silent_for = now - last
-                if silent_for > AGG_HEALTH_TIMEOUT_SECS and agg not in _aggregator_down:
-                    _aggregator_down.add(agg)
-                    alert = {
-                        "ts": str(now), "device_id": f"agg:{agg}", "metric": "aggregator_health",
-                        "value": str(silent_for), "threshold": str(AGG_HEALTH_TIMEOUT_SECS),
-                        "op": ">", "severity": "critical",
-                        "message": f"Agregador '{agg}' sem repassar dados há {silent_for}s.",
-                    }
-                    await _publish_alert(alert)
-                    await insert_alert_history([alert])
-                    log.warning("SAÚDE: agregador '%s' inativo (%ds sem relay).", agg, silent_for)
-                elif silent_for <= AGG_HEALTH_TIMEOUT_SECS and agg in _aggregator_down:
-                    _aggregator_down.discard(agg)
-                    alert = {
-                        "ts": str(now), "device_id": f"agg:{agg}", "metric": "aggregator_health",
-                        "value": "0", "threshold": str(AGG_HEALTH_TIMEOUT_SECS),
-                        "op": "<=", "severity": "info",
-                        "message": f"Agregador '{agg}' voltou a repassar dados.",
-                    }
-                    await _publish_alert(alert)
-                    await insert_alert_history([alert])
-                    log.info("SAÚDE: agregador '%s' recuperado.", agg)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.debug("Falha no monitor de saúde de agregadores: %s", exc)
-
-        await asyncio.sleep(AGG_HEALTH_CHECK_SECS)
 
 
 async def metrics_retention_loop():
@@ -1090,6 +1054,15 @@ async def metrics_retention_loop():
                     )
                     deleted_parts.append(f"{table_name}={cursor.rowcount}")
 
+                # Uma mensagem expirada já é recusada na entrada. O checkpoint
+                # de ordem por dispositivo permanece mesmo após limpar os IDs.
+                if MESSAGE_MAX_AGE_SECS > 0:
+                    cursor = await db.execute(
+                        "DELETE FROM telemetry_messages WHERE timestamp < ?",
+                        (now - MESSAGE_MAX_AGE_SECS,),
+                    )
+                    deleted_parts.append(f"message_ids={cursor.rowcount}")
+
                 await db.commit()
 
             log.debug("Retenção de métricas executada (%s).", ", ".join(deleted_parts) or "sem limites")
@@ -1111,105 +1084,6 @@ def new_client_response(success: bool = True) -> messages_pb2.ClientResponse:
     resp.timestamp  = int(time.time())
     return resp
 
-async def handle_auth_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    peer = writer.get_extra_info('peername')
-    log.info("Nova conexao de Autenticacao de %s", peer)
-    try:
-        raw_len = await asyncio.wait_for(reader.readexactly(4), timeout=5.0)
-        msg_len = struct.unpack("!I", raw_len)[0]
-        payload = await asyncio.wait_for(reader.readexactly(msg_len), timeout=5.0)
-        
-        req = messages_pb2.AuthRequest()
-        req.ParseFromString(payload)
-        
-        expected_hex = _HEX_SERVICE_CODES.get(req.type)
-        if not expected_hex or expected_hex != req.hex_service_code:
-            raise InvalidHexServiceCodeException(f"Hex invalido: esperado {expected_hex}, recebido {req.hex_service_code}")
-            
-        if f"SMARTCITY-{req.license_key_part}-LICENSE" != GATEWAY_LICENSE_KEY:
-            raise InvalidLicenseKeyException(f"Chave de licenca invalida")
-            
-        aggregator_id = None
-        existing_port = 0
-        for _ in range(3):
-            async with get_db_pool().connection() as db:
-                async with db.execute(
-                    "SELECT aggregator_id, telemetry_port FROM devices WHERE device_id = ?",
-                    (req.device_id,),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    if row and row[0]:
-                        aggregator_id = row[0]
-                        existing_port = int(row[1] or 0)
-                        break
-            await asyncio.sleep(1.0)
-
-        if not aggregator_id:
-            raise Exception("Dispositivo nao encontrado via Discovery ainda. Agregador desconhecido.")
-
-        # Reutiliza a porta já atribuída a este dispositivo em uma autenticação
-        # anterior (ex.: sensor reiniciou). Sem isso, cada re-auth alocava uma
-        # nova porta e a antiga vazava permanentemente de _AVAILABLE_PORTS
-        # (a porta antiga sumia da coluna telemetry_port e nunca era reciclada),
-        # esgotando o pool após sucessivos reinícios.
-        if (
-            MIN_DYNAMIC_PORT <= existing_port < (MIN_DYNAMIC_PORT + MAX_AVAILABLE_PORTS)
-            and existing_port not in _AVAILABLE_PORTS
-        ):
-            port = existing_port
-        else:
-            port = allocate_dynamic_port()
-
-        async with get_db_pool().connection() as db:
-            await db.execute("UPDATE devices SET telemetry_port = ? WHERE device_id = ?", (port, req.device_id))
-            await db.commit()
-        
-        # Abre a porta em todos os agregadores conhecidos (inclui o do device),
-        # tornando a telemetria resiliente a trocas de rota do load-balancer.
-        target_aggregators = set(_KNOWN_AGGREGATORS) | {aggregator_id}
-        client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
-        for agg in target_aggregators:
-            await client.lpush(f"agg_control_{agg}", f"ABRIR_PORTA_UDP: {port}")
-        await client.close()
-
-        resp = messages_pb2.AuthResponse()
-        resp.success = True
-        resp.message = "OK"
-        resp.assigned_port = port
-        
-        resp_payload = resp.SerializeToString()
-        writer.write(struct.pack("!I", len(resp_payload)))
-        writer.write(resp_payload)
-        await writer.drain()
-        
-        log.info("Auth SUCCESS: %s porta alocada %d no agregador %s", req.device_id, port, aggregator_id)
-        
-    except Exception as e:
-        log.error("Auth FAIL para %s: %s", peer, e)
-        resp = messages_pb2.AuthResponse()
-        resp.success = False
-        resp.message = str(e)
-        resp.assigned_port = 0
-        resp_payload = resp.SerializeToString()
-        writer.write(struct.pack("!I", len(resp_payload)))
-        writer.write(resp_payload)
-        try:
-            await writer.drain()
-        except:
-            pass
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-
-
-@dataclass(slots=True)
-class OlapSource:
-    name: str
-    table_name: str
-    bucket_size: int
-    is_rollup: bool
-
 
 @dataclass(slots=True)
 class OlapQueryResult:
@@ -1222,32 +1096,18 @@ class OlapQueryResult:
 
 
 def choose_olap_source(start_timestamp: int, end_timestamp: int) -> OlapSource:
-    window_secs = max(0, end_timestamp - start_timestamp)
-    if window_secs <= OLAP_RAW_MAX_WINDOW_SECS:
-        return OlapSource("raw", "metrics", 0, False)
-    if window_secs <= OLAP_1M_MAX_WINDOW_SECS:
-        return OlapSource("rollup_1m", "metrics_rollup_1m", 60, True)
-    if window_secs <= OLAP_5M_MAX_WINDOW_SECS:
-        return OlapSource("rollup_5m", "metrics_rollup_5m", 300, True)
-    return OlapSource("rollup_1h", "metrics_rollup_1h", 3600, True)
-
-
-def olap_time_range(source: OlapSource, start_timestamp: int, end_timestamp: int) -> tuple[int, int]:
-    if not source.is_rollup:
-        return start_timestamp, end_timestamp
-
-    return (
-        (start_timestamp // source.bucket_size) * source.bucket_size,
-        (end_timestamp // source.bucket_size) * source.bucket_size,
+    return select_olap_source(
+        start_timestamp,
+        end_timestamp,
+        OLAP_RAW_MAX_WINDOW_SECS,
+        OLAP_1M_MAX_WINDOW_SECS,
+        OLAP_5M_MAX_WINDOW_SECS,
+        now_timestamp=int(time.time()),
+        raw_retention_secs=METRICS_RAW_RETENTION_SECS,
+        rollup_1m_retention_secs=ROLLUP_1M_RETENTION_SECS,
+        rollup_5m_retention_secs=ROLLUP_5M_RETENTION_SECS,
+        rollup_1h_retention_secs=ROLLUP_1H_RETENTION_SECS,
     )
-
-
-def sample_stddev(sample_count: int, value_sum: float, value_sum_sq: float) -> float:
-    if sample_count <= 1:
-        return 0.0
-
-    variance = (value_sum_sq - ((value_sum * value_sum) / sample_count)) / (sample_count - 1)
-    return math.sqrt(max(0.0, variance))
 
 
 async def fetch_graph_rows(
@@ -1257,8 +1117,15 @@ async def fetch_graph_rows(
     start_timestamp: int,
     end_timestamp: int,
     target_device_id: str = "",
-) -> list[tuple[int, float, str]]:
-    # Query construída dinamicamente com base em (is_rollup × target_device_id).
+) -> tuple[list[tuple[int, float, str]], int]:
+    """Retorna uma série limitada e o total de pontos disponíveis.
+
+    Quando a consulta excede ``OLAP_MAX_GRAPH_POINTS``, o banco calcula uma
+    posição estável por ``timestamp/device/id`` e devolve uma amostra uniforme
+    que sempre preserva os extremos. Assim, a memória e o frame TCP ficam
+    limitados sem carregar toda a série em Python.
+    """
+
     query_start, query_end = olap_time_range(source, start_timestamp, end_timestamp)
 
     params: list = [metric_name, query_start, query_end]
@@ -1268,27 +1135,72 @@ async def fetch_graph_rows(
         params.append(target_device_id)
 
     if source.is_rollup:
-        query = f"""
-            SELECT bucket_start,
-                   value_sum / sample_count AS bucket_avg,
-                   device_id
-            FROM {source.table_name}
-            WHERE metric_name = ? AND bucket_start BETWEEN ? AND ? {device_filter}
-            ORDER BY bucket_start ASC, device_id ASC
-        """
+        time_expression = "bucket_start"
+        value_expression = "value_sum / sample_count"
+        order_expression = "bucket_start ASC, device_id ASC"
     else:
-        query = f"""
-            SELECT timestamp, value, device_id
-            FROM metrics
-            WHERE metric_name = ? AND timestamp BETWEEN ? AND ? {device_filter}
-            ORDER BY timestamp ASC
-        """
+        time_expression = "timestamp"
+        value_expression = "value"
+        # ``id`` desempata leituras do mesmo dispositivo no mesmo segundo.
+        order_expression = "timestamp ASC, device_id ASC, id ASC"
 
-    async with db.execute(query, params) as cursor:
-        return [
+    where_clause = (
+        f"metric_name = ? AND {time_expression} BETWEEN ? AND ? {device_filter}"
+    )
+    async with db.execute(
+        f"SELECT COUNT(*) FROM {source.table_name} WHERE {where_clause}",
+        params,
+    ) as cursor:
+        count_row = await cursor.fetchone()
+
+    total_points = int(count_row[0] or 0)
+    if total_points == 0:
+        return [], 0
+
+    if total_points <= OLAP_MAX_GRAPH_POINTS:
+        query = f"""
+            SELECT {time_expression}, {value_expression}, device_id
+            FROM {source.table_name}
+            WHERE {where_clause}
+            ORDER BY {order_expression}
+            LIMIT ?
+        """
+        query_params = [*params, OLAP_MAX_GRAPH_POINTS]
+    else:
+        stride = graph_sampling_stride(total_points, OLAP_MAX_GRAPH_POINTS)
+        last_index = total_points - 1
+        query = f"""
+            WITH ordered_points AS (
+                SELECT
+                    {time_expression} AS point_timestamp,
+                    {value_expression} AS point_value,
+                    device_id,
+                    ROW_NUMBER() OVER (ORDER BY {order_expression}) - 1 AS sample_index
+                FROM {source.table_name}
+                WHERE {where_clause}
+            )
+            SELECT point_timestamp, point_value, device_id
+            FROM ordered_points
+            WHERE
+                (sample_index < ? AND sample_index % ? = 0)
+                OR sample_index = ?
+            ORDER BY sample_index ASC
+            LIMIT ?
+        """
+        query_params = [
+            *params,
+            last_index,
+            stride,
+            last_index,
+            OLAP_MAX_GRAPH_POINTS,
+        ]
+
+    async with db.execute(query, query_params) as cursor:
+        rows = [
             (int(ts), float(value), str(device_id))
             for ts, value, device_id in await cursor.fetchall()
         ]
+    return rows, total_points
 
 
 async def execute_olap_from_source(
@@ -1298,6 +1210,19 @@ async def execute_olap_from_source(
 ) -> OlapQueryResult:
     # Queries construídas dinamicamente com base em (is_rollup × target_device_id).
     query_start, query_end = olap_time_range(source, req.start_timestamp, req.end_timestamp)
+    window_label = ""
+    if source.is_rollup:
+        effective_end = query_end + source.bucket_size - 1
+        if query_start != req.start_timestamp or effective_end != req.end_timestamp:
+            try:
+                start_label = datetime.fromtimestamp(query_start, timezone.utc).isoformat()
+                end_label = datetime.fromtimestamp(effective_end, timezone.utc).isoformat()
+            except (ValueError, OverflowError, OSError):
+                start_label, end_label = str(query_start), str(effective_end)
+            window_label = (
+                f" Janela agregada: {start_label} até {end_label}. "
+                "As agregações das bordas podem incluir amostras fora do período solicitado."
+            )
 
     # Fragmentos que diferem entre rollup e raw
     if source.is_rollup:
@@ -1351,17 +1276,22 @@ async def execute_olap_from_source(
         else:
             analytics_result = sample_stddev(sample_count, value_sum, value_sum_sq)
 
-        graph_rows = await fetch_graph_rows(
+        graph_rows, graph_total_points = await fetch_graph_rows(
             db, source, req.query_metric, req.start_timestamp, req.end_timestamp, req.target_device_id,
         )
         bucket_label = f", bucket={source.bucket_size}s" if source.is_rollup else ""
+        graph_label = (
+            f"Pontos retornados: {len(graph_rows)} de {graph_total_points} (amostrados)."
+            if graph_total_points > len(graph_rows)
+            else f"Pontos retornados: {len(graph_rows)}."
+        )
         return OlapQueryResult(
             success=True,
             message="",
             analytics_result=analytics_result,
             result_metadata=(
                 f"Fonte OLAP: {source.name}{bucket_label}. "
-                f"Amostras processadas: {sample_count}. Pontos retornados: {len(graph_rows)}."
+                f"Amostras processadas: {sample_count}. {graph_label}{window_label}"
             ),
             graph_rows=graph_rows,
             sample_count=sample_count,
@@ -1396,10 +1326,15 @@ async def execute_olap_from_source(
         )
         max_variation = float(max_value) - float(min_value)
         sample_count  = sum(int(row[1]) for row in variation_rows)
-        graph_rows    = await fetch_graph_rows(
+        graph_rows, graph_total_points = await fetch_graph_rows(
             db, source, req.query_metric, req.start_timestamp, req.end_timestamp, req.target_device_id,
         )
         bucket_label = f", bucket={source.bucket_size}s" if source.is_rollup else ""
+        graph_label = (
+            f"{len(graph_rows)} de {graph_total_points} pontos de gráfico amostrados."
+            if graph_total_points > len(graph_rows)
+            else f"{len(graph_rows)} pontos de gráfico retornados."
+        )
         return OlapQueryResult(
             success=True,
             message="",
@@ -1407,106 +1342,12 @@ async def execute_olap_from_source(
             result_metadata=(
                 f"Fonte OLAP: {source.name}{bucket_label}. "
                 f"Maior variação: dispositivo {best_dev} — "
-                f"{len(variation_rows)} nós avaliados, {sample_count} amostras."
+                f"{len(variation_rows)} nós avaliados, {sample_count} amostras. "
+                f"{graph_label}{window_label}"
             ),
             graph_rows=graph_rows,
             sample_count=sample_count,
         )
-
-    if req.query_op in (messages_pb2.OP_ANOMALY_DETECTION, messages_pb2.OP_PERCENTILE_95, messages_pb2.OP_LINEAR_TREND):
-        graph_rows = await fetch_graph_rows(
-            db, source, req.query_metric, req.start_timestamp, req.end_timestamp, req.target_device_id,
-        )
-        bucket_label = f", bucket={source.bucket_size}s" if source.is_rollup else ""
-
-        if not graph_rows:
-            return OlapQueryResult(
-                success=False,
-                message="Dados insuficientes para análise avançada.",
-                analytics_result=0.0,
-                result_metadata="",
-                graph_rows=[],
-                sample_count=0,
-            )
-
-        values = [r[1] for r in graph_rows]
-        sample_count = len(values)
-
-        if req.query_op == messages_pb2.OP_ANOMALY_DETECTION:
-            mean = sum(values) / sample_count
-            variance = sum((v - mean) ** 2 for v in values) / sample_count
-            std_dev = variance ** 0.5
-            threshold = 3 * std_dev
-            
-            anomalies = [r for r in graph_rows if abs(r[1] - mean) > threshold]
-            anomaly_count = len(anomalies)
-            
-            return OlapQueryResult(
-                success=True,
-                message="",
-                analytics_result=float(anomaly_count),
-                result_metadata=(
-                    f"Fonte OLAP: {source.name}{bucket_label}. "
-                    f"Anomalias (Z-Score > 3): {anomaly_count} de {sample_count} amostras analisadas."
-                ),
-                graph_rows=anomalies,
-                sample_count=sample_count,
-            )
-
-        if req.query_op == messages_pb2.OP_PERCENTILE_95:
-            sorted_values = sorted(values)
-            idx = int(0.95 * sample_count)
-            if idx >= sample_count: idx = sample_count - 1
-            p95 = sorted_values[idx]
-            
-            return OlapQueryResult(
-                success=True,
-                message="",
-                analytics_result=p95,
-                result_metadata=(
-                    f"Fonte OLAP: {source.name}{bucket_label}. "
-                    f"Percentil 95 calculado sobre {sample_count} pontos agregados."
-                ),
-                graph_rows=graph_rows,
-                sample_count=sample_count,
-            )
-
-        if req.query_op == messages_pb2.OP_LINEAR_TREND:
-            if sample_count < 2:
-                return OlapQueryResult(
-                    success=False,
-                    message="Dados insuficientes para calcular tendência (mínimo 2 pontos).",
-                    analytics_result=0.0,
-                    result_metadata="",
-                    graph_rows=graph_rows,
-                    sample_count=sample_count,
-                )
-                
-            x_values = [r[0] for r in graph_rows]
-            x_min = min(x_values)
-            x_norm = [x - x_min for x in x_values]
-            
-            sum_x = sum(x_norm)
-            sum_y = sum(values)
-            sum_xy = sum(x * y for x, y in zip(x_norm, values))
-            sum_xx = sum(x * x for x in x_norm)
-            
-            denominator = (sample_count * sum_xx) - (sum_x * sum_x)
-            slope = 0.0
-            if denominator != 0:
-                slope = ((sample_count * sum_xy) - (sum_x * sum_y)) / denominator
-                
-            return OlapQueryResult(
-                success=True,
-                message="",
-                analytics_result=slope,
-                result_metadata=(
-                    f"Fonte OLAP: {source.name}{bucket_label}. "
-                    f"Tendência Linear (Slope): {slope:.6f} unidades/segundo."
-                ),
-                graph_rows=graph_rows,
-                sample_count=sample_count,
-            )
 
     return OlapQueryResult(
         success=False,
@@ -1535,241 +1376,20 @@ async def execute_adaptive_olap(db, req: messages_pb2.ClientRequest) -> OlapQuer
     return fallback
 
 
-async def audit_command(
-    peer_ip: str,
-    target_device_id: str,
-    command_id: str,
-    action: str,
-    success: bool,
-    message: str,
-):
-    """Registra um comando de atuação no stream Redis 'audit' (append-only).
-
-    Tolerante a falhas: um erro de auditoria nunca deve abortar o comando.
-    """
-    try:
-        client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
-        await client.xadd(
-            "audit",
-            {
-                "ts": str(int(time.time())),
-                "peer": peer_ip or "?",
-                "target": target_device_id or "",
-                "command_id": command_id or "",
-                "action": action or "",
-                "success": "1" if success else "0",
-                "message": (message or "")[:200],
-            },
-            maxlen=10000,
-            approximate=True,
-        )
-        await client.close()
-    except Exception as exc:
-        log.debug("Falha ao gravar auditoria no Redis: %s", exc)
-
-
-def _describe_command_action(cmd: messages_pb2.ConfigCommand) -> str:
-    parts = []
-    if cmd.update_status:
-        parts.append(f"status={messages_pb2.DeviceStatus.Name(cmd.target_status)}")
-    if cmd.update_frequency:
-        parts.append(f"freq={cmd.new_frequency_secs}s")
-    return ", ".join(parts) if parts else "leitura/no-op"
-
-
-async def dispatch_command_to_device(
-    cmd: messages_pb2.ConfigCommand,
-    source_label: str,
-) -> tuple[bool, str]:
-    """Encaminha um ConfigCommand a um nó atuador (framing + cripto opcional) e audita.
-
-    Reutilizado pelo proxy do cliente (SEND_COMMAND) e pelo motor de automação.
-    Retorna (sucesso, mensagem). `cmd.target_device_id` deve estar preenchido.
-    """
-    target_device_id = cmd.target_device_id
-    async with get_db_pool().connection() as db:
-        async with db.execute(
-            "SELECT ip_address, control_port FROM devices WHERE device_id = ?",
-            (target_device_id,),
-        ) as cursor:
-            target = await cursor.fetchone()
-
-    if not target or target[1] <= 0:
-        success, message = False, "Nó não encontrado ou desprovido de porta de controle."
-        await audit_command(source_label, target_device_id, cmd.command_id,
-                            _describe_command_action(cmd), success, message)
-        return success, message
-
-    success, message = False, ""
-    s_w = None
-    try:
-        s_r, s_w = await asyncio.wait_for(
-            asyncio.open_connection(target[0], target[1]), timeout=5.0,
-        )
-        # Carimbo de tempo do gateway (emissor confiável) p/ janela anti-replay.
-        cmd.timestamp = int(time.time())
-        cmd_bytes = cmd.SerializeToString()
-        if CONTROL_SECURE:
-            cmd_bytes = encrypt_control(cmd_bytes)
-        s_w.write(struct.pack(">I", len(cmd_bytes)) + cmd_bytes)
-        await s_w.drain()
-
-        s_header = await asyncio.wait_for(s_r.readexactly(4), timeout=5.0)
-        s_len = struct.unpack(">I", s_header)[0]
-        if s_len <= 0 or s_len > TCP_MAX_FRAME_BYTES:
-            raise ValueError(f"frame de resposta inválido do nó alvo: {s_len} bytes")
-        s_body = await asyncio.wait_for(s_r.readexactly(s_len), timeout=5.0)
-        if CONTROL_SECURE:
-            s_body = decrypt_payload(s_body)
-        node_resp = messages_pb2.ConfigResponse()
-        node_resp.ParseFromString(s_body)
-        success, message = node_resp.success, node_resp.message
-        log.info("CMD '%s' → '%s' (%s): sucesso=%s.",
-                 cmd.command_id, target_device_id, source_label, success)
-    except asyncio.TimeoutError:
-        success, message = False, "Timeout de I/O com o nó alvo durante atuação remota."
-        log.warning("Timeout ao encaminhar comando para '%s'.", target_device_id)
-    except ConnectionRefusedError as exc:
-        success, message = False, f"Nó alvo recusou a conexão TCP: {exc}"
-        log.warning("Conexão recusada por '%s': %s", target_device_id, exc)
-    except (asyncio.IncompleteReadError, struct.error, DecodeError, ValueError) as exc:
-        success, message = False, f"Resposta TCP/Protobuf inválida do nó alvo: {exc}"
-        log.warning("Frame inválido de '%s': %s", target_device_id, exc)
-    except OSError as exc:
-        success, message = False, f"Falha de socket com o nó alvo: {exc}"
-        log.warning("Falha de socket ao encaminhar comando para '%s': %s", target_device_id, exc)
-    finally:
-        if s_w is not None:
-            s_w.close()
-            try:
-                await s_w.wait_closed()
-            except Exception:
-                pass
-
-    await audit_command(source_label, target_device_id, cmd.command_id,
-                        _describe_command_action(cmd), success, message)
-    _METRICS["commands_total"] += 1
-    if not success:
-        _METRICS["commands_failed_total"] += 1
-    return success, message
-
-
-# ====================================================================
-# [FASE B] MOTOR DE AUTOMAÇÃO (IFTTT) — regras editáveis pela UI
-#   Regras vivem no Redis (chave 'automation_rules', JSON), são recarregadas
-#   periodicamente e avaliadas sobre a telemetria; ao romper, disparam um
-#   comando de atuação via dispatch_command_to_device (com cooldown por regra).
-# ====================================================================
-
-AUTOMATION_REFRESH_SECS = max(1, int(os.getenv("AUTOMATION_REFRESH_SECS", "5")))
-AUTOMATION_RULES: list[dict] = []
-_automation_last_fired: dict[tuple[str, str], int] = {}
-
-
-def _status_to_int(value) -> int:
-    """Aceita status como int (1/2/3) ou nome ('STATUS_OFF')."""
-    if isinstance(value, int):
-        return value
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        pass
-    try:
-        return messages_pb2.DeviceStatus.Value(str(value))
-    except ValueError:
-        return messages_pb2.STATUS_OFF
-
-
-async def automation_rules_refresh_loop():
-    """Recarrega periodicamente regras de automação e silenciamentos de alerta do Redis."""
-    global AUTOMATION_RULES, ALERT_SILENCES
-    while True:
-        try:
-            if REDIS_PUB is not None:
-                raw = await REDIS_PUB.get("automation_rules")
-                AUTOMATION_RULES = json.loads(raw) if raw else []
-
-                # Silenciamentos: hash 'alert_silences' {device|metric: expiry_epoch}.
-                # Descarta os já expirados (limpeza preguiçosa).
-                now = int(time.time())
-                raw_sil = await REDIS_PUB.hgetall("alert_silences")
-                silences = {}
-                for field, value in (raw_sil or {}).items():
-                    try:
-                        key = field.decode() if isinstance(field, bytes) else field
-                        # REDIS_PUB não usa decode_responses → value vem em bytes.
-                        val = value.decode() if isinstance(value, bytes) else value
-                        expiry = int(val)
-                        if expiry > now:
-                            silences[key] = expiry
-                    except (TypeError, ValueError):
-                        continue
-                ALERT_SILENCES = silences
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.debug("Falha ao carregar config (regras/silenciamentos): %s", exc)
-        await asyncio.sleep(AUTOMATION_REFRESH_SECS)
-
-
-async def evaluate_automation(batch: list[TelemetryEnvelope]):
-    """Avalia as regras de automação sobre um batch e dispara as ações."""
-    rules = AUTOMATION_RULES
-    if not rules:
-        return
-    now = int(time.time())
-    for envelope in batch:
-        for sample in envelope.metrics:
-            for rule in rules:
-                if not rule.get("enabled", True):
-                    continue
-                if rule.get("metric") != sample.metric_name:
-                    continue
-                try:
-                    threshold = float(rule["threshold"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if not _threshold_breached(rule.get("op", ">="), sample.value, threshold):
-                    continue
-
-                # Alvo: device fixo da regra ou o próprio device que rompeu.
-                target = rule.get("target_device_id") or sample.device_id
-                cooldown = max(1, int(rule.get("cooldown_secs", 60)))
-                key = (str(rule.get("id", "")), target)
-                if now - _automation_last_fired.get(key, 0) < cooldown:
-                    continue
-                _automation_last_fired[key] = now
-
-                cmd = messages_pb2.ConfigCommand()
-                cmd.command_id = f"AUTO-{str(rule.get('id', 'rule'))[:8]}-{uuid.uuid4().hex[:4]}"
-                cmd.target_device_id = target
-                if rule.get("action_status"):
-                    cmd.update_status = True
-                    cmd.target_status = _status_to_int(rule.get("status"))
-                if rule.get("action_freq"):
-                    cmd.update_frequency = True
-                    cmd.new_frequency_secs = max(1, int(rule.get("frequency_secs", 5)))
-
-                if not cmd.update_status and not cmd.update_frequency:
-                    continue  # regra sem ação efetiva
-
-                task = asyncio.create_task(
-                    dispatch_command_to_device(cmd, f"automation:{rule.get('id', '')}")
-                )
-                _BACKGROUND_TASKS.add(task)
-                task.add_done_callback(_BACKGROUND_TASKS.discard)
-                log.info(
-                    "Automação '%s' disparada por %s=%.1f → %s",
-                    rule.get("name", rule.get("id", "?")), sample.metric_name, sample.value, target,
-                )
-
-
 async def build_client_response(
     req: messages_pb2.ClientRequest,
     peer,
 ) -> messages_pb2.ClientResponse:
     """Processa uma requisição já desserializada e preserva o contrato ClientResponse."""
     resp = new_client_response(success=True)
+    resp.message_id = req.message_id
+
+    validation_error = validate_client_request(req)
+    if validation_error:
+        resp.success = False
+        resp.message = f"Requisição rejeitada: {validation_error}."
+        log.warning("Requisição TCP inválida de %s: %s.", peer, validation_error)
+        return resp
 
     # ── Rota: Sincronização de Inventário ────────────────────────────
     if req.type == messages_pb2.REQUEST_TYPE_LIST_DEVICES:
@@ -1777,11 +1397,11 @@ async def build_client_response(
             # [R1] Colunas explícitas — resistente a mudanças futuras de schema
             async with db.execute("""
                 SELECT device_id, type, status, ip_address,
-                       control_port, is_controllable, last_seen, aggregator_id, coord_x, coord_y
+                       control_port, is_controllable, last_seen
                 FROM devices
             """) as cursor:
                 async for row in cursor:
-                    device_id, dtype, status, ip, ctrl_port, is_ctrl, last_seen, agg_id, cx, cy = row
+                    device_id, dtype, status, ip, ctrl_port, is_ctrl, last_seen = row
                     d = resp.devices.add()
                     d.device_id           = device_id
                     d.type                = dtype
@@ -1790,10 +1410,6 @@ async def build_client_response(
                     d.control_port        = ctrl_port
                     d.is_controllable     = bool(is_ctrl)
                     d.last_seen_timestamp = last_seen
-                    d.coord_x = cx if cx is not None else 0
-                    d.coord_y = cy if cy is not None else 0
-                    if agg_id:
-                        d.aggregator_id = agg_id
 
         resp.message = "Sincronização de topologia extraída via pool aiosqlite."
         log.info("LIST_DEVICES → %d nós retornados para %s.", len(resp.devices), peer)
@@ -1801,11 +1417,85 @@ async def build_client_response(
 
     # ── Rota: Proxy de Atuação Remota ────────────────────────────────
     if req.type == messages_pb2.REQUEST_TYPE_SEND_COMMAND:
-        req.command_payload.target_device_id = req.target_device_id
-        peer_ip = peer[0] if peer else "?"
-        resp.success, resp.message = await dispatch_command_to_device(
-            req.command_payload, peer_ip,
-        )
+        async with get_db_pool().connection() as db:
+            async with db.execute(
+                "SELECT ip_address, control_port FROM devices WHERE device_id = ?",
+                (req.target_device_id,),
+            ) as cursor:
+                target = await cursor.fetchone()
+
+        if not target or target[1] <= 0:
+            resp.success = False
+            resp.message = "Nó não encontrado ou desprovido de porta de controle."
+            return resp
+
+        s_w = None
+        try:
+            s_r, s_w = await asyncio.wait_for(
+                asyncio.open_connection(target[0], target[1]),
+                timeout=5.0,
+            )
+
+            # Aplica Framing no envio do comando para os Atuadores (Lua/Java/Python)
+            req.command_payload.target_device_id = req.target_device_id
+            cmd_bytes = req.command_payload.SerializeToString()
+            s_w.write(struct.pack(">I", len(cmd_bytes)) + cmd_bytes)
+            await s_w.drain()
+
+            # Lê a resposta binária do nó alvo respeitando a janela de Framing
+            s_header = await asyncio.wait_for(s_r.readexactly(4), timeout=5.0)
+            s_len    = struct.unpack(">I", s_header)[0]
+            if s_len <= 0 or s_len > TCP_MAX_FRAME_BYTES:
+                raise ValueError(f"frame de resposta inválido do nó alvo: {s_len} bytes")
+            s_body   = await asyncio.wait_for(s_r.readexactly(s_len), timeout=5.0)
+
+            node_resp = messages_pb2.ConfigResponse()
+            node_resp.ParseFromString(s_body)
+            if node_resp.command_id != req.command_payload.command_id:
+                raise ValueError("command_id da resposta não corresponde ao comando enviado")
+            response_error = validate_ingress_timestamp(node_resp.timestamp, "response.timestamp")
+            if response_error:
+                raise ValueError(response_error)
+            if node_resp.success and (
+                int(node_resp.updated_status) not in VALID_DEVICE_STATUSES
+                or not 1 <= node_resp.updated_frequency_secs <= 60
+            ):
+                raise ValueError("estado ou frequência inválidos na confirmação do comando")
+            if node_resp.success and (
+                (req.command_payload.update_status
+                 and node_resp.updated_status != req.command_payload.target_status)
+                or (req.command_payload.update_frequency
+                    and node_resp.updated_frequency_secs != req.command_payload.new_frequency_secs)
+            ):
+                raise ValueError("confirmação do nó não contém as alterações solicitadas")
+
+            resp.success, resp.message = node_resp.success, node_resp.message
+            log.info(
+                "SEND_COMMAND '%s' → '%s': sucesso=%s.",
+                req.command_payload.command_id, req.target_device_id, resp.success,
+            )
+        except asyncio.TimeoutError:
+            resp.success = False
+            resp.message = "Timeout de I/O com o nó alvo durante atuação remota."
+            log.warning("Timeout ao encaminhar comando para '%s'.", req.target_device_id)
+        except ConnectionRefusedError as exc:
+            resp.success = False
+            resp.message = f"Nó alvo recusou a conexão TCP: {exc}"
+            log.warning("Conexão recusada por '%s': %s", req.target_device_id, exc)
+        except (asyncio.IncompleteReadError, struct.error, DecodeError, ValueError) as exc:
+            resp.success = False
+            resp.message = f"Resposta TCP/Protobuf inválida do nó alvo: {exc}"
+            log.warning("Frame inválido de '%s': %s", req.target_device_id, exc)
+        except OSError as exc:
+            resp.success = False
+            resp.message = f"Falha de socket com o nó alvo: {exc}"
+            log.warning("Falha de socket ao encaminhar comando para '%s': %s", req.target_device_id, exc)
+        finally:
+            if s_w is not None:
+                s_w.close()
+                with suppress(OSError):
+                    await s_w.wait_closed()
+
         return resp
 
     # ── Rota: Agregações Estatísticas (OLAP) ─────────────────────────
@@ -1850,6 +1540,8 @@ async def send_client_response(
 async def handle_client_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Pipeline TCP assíncrono com Length-Prefix Framing e conexão persistente."""
     peer = writer.get_extra_info("peername")
+    task = asyncio.current_task()
+    _CLIENT_TASKS.add(task)
     try:
         while True:
             try:
@@ -1917,6 +1609,7 @@ async def handle_client_request(reader: asyncio.StreamReader, writer: asyncio.St
                 )
                 resp = new_client_response(success=False)
                 resp.message = "Erro interno no Gateway — consulte os logs do servidor."
+            resp.message_id = req.message_id
             await send_client_response(writer, resp)
 
     except (ConnectionResetError, BrokenPipeError) as exc:
@@ -1924,152 +1617,36 @@ async def handle_client_request(reader: asyncio.StreamReader, writer: asyncio.St
     except OSError as exc:
         log.warning("Erro de socket no handler TCP (%s): %s", peer, exc)
     finally:
+        _CLIENT_TASKS.discard(task)
         writer.close()
-        await writer.wait_closed()
-
-
-# ====================================================================
-# [FASE E] OBSERVABILIDADE — snapshot, Prometheus e heartbeats de agregadores
-# ====================================================================
-
-async def build_metrics_snapshot() -> dict:
-    """Coleta contadores + gauges + saúde dos agregadores num dicionário."""
-    queue_size = TELEMETRY_QUEUE.qsize() if TELEMETRY_QUEUE is not None else 0
-    devices_total = devices_online = 0
-    try:
-        async with get_db_pool().connection() as db:
-            async with db.execute(
-                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) FROM devices",
-                (messages_pb2.STATUS_ON,),
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    devices_total = int(row[0] or 0)
-                    devices_online = int(row[1] or 0)
-    except Exception:
-        pass
-
-    now = int(time.time())
-    aggregators = {}
-    for agg in sorted(_KNOWN_AGGREGATORS):
-        last = _aggregator_last_seen.get(agg, 0)
-        up = 1 if (last > 0 and now - last <= AGG_HEALTH_TIMEOUT_SECS) else 0
-        aggregators[agg] = {"up": up, "last_seen": last, "silent_for": (now - last) if last else -1}
-
-    return {
-        "ts": now,
-        "counters": dict(_METRICS),
-        "gauges": {
-            "telemetry_queue_size": queue_size,
-            "telemetry_queue_max": TELEMETRY_QUEUE_MAXSIZE,
-            "available_ports": len(_AVAILABLE_PORTS),
-            "max_ports": MAX_AVAILABLE_PORTS,
-            "known_aggregators": len(_KNOWN_AGGREGATORS),
-            "devices_total": devices_total,
-            "devices_online": devices_online,
-            "control_secure": 1 if CONTROL_SECURE else 0,
-        },
-        "aggregators": aggregators,
-    }
-
-
-async def build_prometheus_text() -> str:
-    """Renderiza o snapshot no formato de exposição do Prometheus."""
-    snap = await build_metrics_snapshot()
-    out: list[str] = []
-
-    def emit(name, value, help_text, typ):
-        out.append(f"# HELP {name} {help_text}")
-        out.append(f"# TYPE {name} {typ}")
-        out.append(f"{name} {value}")
-
-    for key, value in snap["counters"].items():
-        emit(f"gw_{key}", value, key, "counter")
-    for key, value in snap["gauges"].items():
-        emit(f"gw_{key}", value, key, "gauge")
-
-    out.append("# HELP gw_aggregator_up Agregador ativo (1) ou inativo (0)")
-    out.append("# TYPE gw_aggregator_up gauge")
-    for agg, info in snap["aggregators"].items():
-        out.append(f'gw_aggregator_up{{aggregator="{agg}"}} {info["up"]}')
-    return "\n".join(out) + "\n"
-
-
-async def handle_prometheus(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Servidor HTTP mínimo que expõe /metrics no formato Prometheus."""
-    try:
-        request_line = await asyncio.wait_for(reader.readline(), timeout=3.0)
-        # Drena os cabeçalhos (best-effort) até a linha em branco.
-        while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=3.0)
-            if line in (b"\r\n", b"\n", b""):
-                break
-
-        path = b""
-        parts = request_line.split(b" ")
-        if len(parts) >= 2:
-            path = parts[1]
-
-        if path.startswith(b"/metrics"):
-            body = (await build_prometheus_text()).encode("utf-8")
-            status = "200 OK"
-            ctype = "text/plain; version=0.0.4; charset=utf-8"
-        else:
-            body = b"Smart City Gateway - /metrics\n"
-            status = "200 OK"
-            ctype = "text/plain; charset=utf-8"
-
-        header = (
-            f"HTTP/1.1 {status}\r\n"
-            f"Content-Type: {ctype}\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode("utf-8")
-        writer.write(header + body)
-        await writer.drain()
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.close()
+        with suppress(OSError):
             await writer.wait_closed()
-        except Exception:
-            pass
-
-
-async def metrics_publish_loop():
-    """Lê heartbeats dos agregadores (health ACK) e publica o snapshot no Redis."""
-    await asyncio.sleep(3.0)
-    while True:
-        try:
-            if REDIS_PUB is not None:
-                # Health two-way: agregadores escrevem agg_heartbeat:<id> (com TTL).
-                # Mais confiável que a atividade de relay (não dá falso-positivo
-                # quando o agregador está vivo porém ocioso).
-                for agg in list(_KNOWN_AGGREGATORS):
-                    hb = await REDIS_PUB.get(f"agg_heartbeat:{agg}")
-                    if hb:
-                        try:
-                            ts = int(hb.decode() if isinstance(hb, bytes) else hb)
-                            if ts > _aggregator_last_seen.get(agg, 0):
-                                _aggregator_last_seen[agg] = ts
-                        except (TypeError, ValueError):
-                            pass
-                snapshot = await build_metrics_snapshot()
-                await REDIS_PUB.set("gw_metrics", json.dumps(snapshot))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            log.debug("Falha ao publicar métricas: %s", exc)
-        await asyncio.sleep(GW_METRICS_PUBLISH_SECS)
 
 
 # ====================================================================
 # INICIALIZAÇÃO DO LOOP DE EVENTOS E KERNEL DE BORDAS
 # ====================================================================
 
+async def stop_telemetry_worker(task: asyncio.Task):
+    """Drena os pacotes já admitidos antes de encerrar o consumidor."""
+    drained = True
+    try:
+        await asyncio.wait_for(get_telemetry_queue().join(), TELEMETRY_SHUTDOWN_TIMEOUT_SECS)
+    except asyncio.TimeoutError:
+        drained = False
+        log.error("Tempo limite de %.1fs ao drenar telemetria; há pacotes sem confirmação de gravação.",
+                  TELEMETRY_SHUTDOWN_TIMEOUT_SECS)
+    task.cancel()
+    results = await asyncio.gather(task, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            drained = False
+            log.error("Falha na última gravação de telemetria durante encerramento: %s", result)
+    return drained
+
+
 async def main():
-    global DB_POOL, TELEMETRY_QUEUE, REDIS_PUB
+    global DB_POOL, TELEMETRY_QUEUE
 
     log.info("============================================================")
     log.info("Inicializando nó central (aiosqlite / Framing Distribuído)...")
@@ -2079,9 +1656,15 @@ async def main():
     log.info("OFFLINE_TIMEOUT=%.1fs | OFFLINE_CHECK=%.1fs",
              DEVICE_OFFLINE_TIMEOUT_SECS, DEVICE_OFFLINE_CHECK_INTERVAL_SECS)
     log.info(
-        "OLAP raw<=%ds | 1m<=%ds | 5m<=%ds | raw_retention=%ds | batch=%d payloads/%d rows",
+        "OLAP raw<=%ds | 1m<=%ds | 5m<=%ds | query<=%ds | graph<=%d pontos",
         OLAP_RAW_MAX_WINDOW_SECS, OLAP_1M_MAX_WINDOW_SECS, OLAP_5M_MAX_WINDOW_SECS,
-        METRICS_RAW_RETENTION_SECS, TELEMETRY_BATCH_MAX_PAYLOADS, TELEMETRY_BATCH_MAX_ROWS,
+        OLAP_MAX_QUERY_WINDOW_SECS, OLAP_MAX_GRAPH_POINTS,
+    )
+    log.info(
+        "INGRESS UDP<=%d bytes | métricas<=%d | idade<=%ds | futuro<=%ds | batch=%d payloads/%d rows",
+        UDP_MAX_DATAGRAM_BYTES, MAX_METRICS_PER_PAYLOAD, MESSAGE_MAX_AGE_SECS,
+        MESSAGE_MAX_FUTURE_SKEW_SECS, TELEMETRY_BATCH_MAX_PAYLOADS,
+        TELEMETRY_BATCH_MAX_ROWS,
     )
     log.info("============================================================")
 
@@ -2089,22 +1672,27 @@ async def main():
     DB_POOL = SQLiteConnectionPool(DB_FILE, DB_POOL_SIZE)
     await DB_POOL.start()
     TELEMETRY_QUEUE = asyncio.Queue(maxsize=TELEMETRY_QUEUE_MAXSIZE)
-    REDIS_PUB = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)  # publicação de alertas (Fase B)
 
     loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(shutdown_signal, stop_event.set)
+        except NotImplementedError:
+            # O loop Proactor do Windows não implementa add_signal_handler.
+            signal.signal(shutdown_signal,
+                          lambda *_: loop.call_soon_threadsafe(stop_event.set))
 
-    # Tarefas de leitura do Redis (Substitui datagram endpoints)
-    redis_tel_task  = asyncio.create_task(redis_telemetry_loop())
-    redis_disc_task = asyncio.create_task(redis_discovery_loop())
+    # Provisionando as instâncias de transporte baseadas na segregação de portas
+    telemetry_transport, _ = await loop.create_datagram_endpoint(
+        TelemetryUDPProtocol, local_addr=("0.0.0.0", UDP_TELEMETRY_PORT)
+    )
+    discovery_transport, _ = await loop.create_datagram_endpoint(
+        DiscoveryUDPProtocol, local_addr=("0.0.0.0", UDP_DISCOVERY_PORT)
+    )
 
     # Servidor de Controle TCP
     server = await asyncio.start_server(handle_client_request, "0.0.0.0", TCP_PORT)
-    
-    # Servidor de Autenticação TCP
-    auth_server = await asyncio.start_server(handle_auth_client, "0.0.0.0", AUTH_PORT)
-
-    # Servidor HTTP de métricas Prometheus (/metrics) — [Fase E]
-    prom_server = await asyncio.start_server(handle_prometheus, "0.0.0.0", PROMETHEUS_PORT)
 
     # Tasks de background
     probe_task      = asyncio.create_task(multicast_discovery_probe_loop())
@@ -2112,50 +1700,36 @@ async def main():
     offline_task    = asyncio.create_task(device_offline_monitor_loop())
     telemetry_task  = asyncio.create_task(telemetry_batch_worker_loop())
     retention_task  = asyncio.create_task(metrics_retention_loop())
-    automation_task = asyncio.create_task(automation_rules_refresh_loop())  # [Fase B]
-    agg_health_task = asyncio.create_task(aggregator_health_loop())          # [Fase B+]
-    metrics_task    = asyncio.create_task(metrics_publish_loop())            # [Fase E]
 
     log.info(
-        "Hub pronto. TCP:%d | Lendo dados do Redis (%s:%d)",
-        TCP_PORT, REDIS_HOST, REDIS_PORT,
+        "Hub pronto. TCP:%d | UDP(Telem):%d | UDP(Disc):%d",
+        TCP_PORT, UDP_TELEMETRY_PORT, UDP_DISCOVERY_PORT,
     )
 
     try:
-        async with server, auth_server, prom_server:
-            await asyncio.gather(
-                server.serve_forever(),
-                auth_server.serve_forever(),
-                prom_server.serve_forever(),
-            )
+        await stop_event.wait()
     finally:
-        # Cancela tasks UDP em voo (telemetria/descoberta) antes de fechar
-        # os transportes e o pool. Sem isso, tasks que chegaram no último instante
-        # podem tentar acessar o pool já encerrado.
-        for task in list(_BACKGROUND_TASKS):
+        # Interromper a admissão primeiro permite que join() alcance a fila vazia.
+        server.close()
+        telemetry_transport.close()
+        discovery_transport.close()
+        active_tasks = list(_BACKGROUND_TASKS | _CLIENT_TASKS)
+        for task in active_tasks:
             task.cancel()
-        if _BACKGROUND_TASKS:
-            await asyncio.gather(*_BACKGROUND_TASKS, return_exceptions=True)
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+        await server.wait_closed()
 
         probe_task.cancel()
         checkpoint_task.cancel()
         offline_task.cancel()
-        telemetry_task.cancel()
         retention_task.cancel()
-        automation_task.cancel()
-        agg_health_task.cancel()
-        metrics_task.cancel()
-        redis_tel_task.cancel()
-        redis_disc_task.cancel()
         await asyncio.gather(
-            probe_task, checkpoint_task, offline_task, telemetry_task, retention_task,
-            automation_task, agg_health_task, metrics_task, redis_tel_task, redis_disc_task,
+            probe_task, checkpoint_task, offline_task, retention_task,
             return_exceptions=True,
         )
+        await stop_telemetry_worker(telemetry_task)
         await DB_POOL.close()
-        if REDIS_PUB is not None:
-            await REDIS_PUB.close()
-            REDIS_PUB = None
         DB_POOL = None
         TELEMETRY_QUEUE = None
         log.info("Gateway encerrado.")

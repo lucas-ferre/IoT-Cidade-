@@ -6,24 +6,19 @@ RUN apt-get update && apt-get install -y \
     luarocks \
     build-essential \
     protobuf-compiler \
-    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # lua-protobuf  : serialização Protobuf binária
 # luasocket     : UDP/TCP e funções de tempo (socket.gettime)
 # luaposix      : bindings POSIX — necessário para interceptar SIGTERM/SIGINT
 #                 no shutdown gracioso do sensor (posix.signal)
-# luaossl       : AES-128-GCM do canal de controle seguro (CONTROL_SECURE=1)
 RUN luarocks --lua-version=5.4 install lua-protobuf && \
     luarocks --lua-version=5.4 install luasocket    && \
-    luarocks --lua-version=5.4 install luaposix     && \
-    luarocks --lua-version=5.4 install luaossl
+    luarocks --lua-version=5.4 install luaposix
 
 WORKDIR /app
 
 COPY ./sensor_lua/sensor.lua .
-COPY ./sensor_lua/console.lua .
-COPY ./sensor_lua/control_crypto.lua .
 
 COPY ./common/messages.proto .
 

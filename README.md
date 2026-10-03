@@ -1,416 +1,231 @@
-# Smart City — Sistema Distribuído de Monitoramento Urbano
+# Smart City — Distributed Urban Monitoring
 
-Plataforma de telemetria e controle para dispositivos urbanos distribuídos.
-Sensores heterogêneos (C, Lua, Java, Python) comunicam-se com um gateway central via
-**UDP/TCP + Protocol Buffers**, com persistência em SQLite e dashboard analítico em Streamlit.
+[![CI](https://github.com/lucas-ferre/projeto_socket/actions/workflows/ci.yml/badge.svg)](https://github.com/lucas-ferre/projeto_socket/actions/workflows/ci.yml)
 
----
+Laboratório distribuído de **telemetria, descoberta, controle remoto e análise de
+dados urbanos**. Cinco implementações de sensores — C, Lua, Java, Python e Go —
+compartilham um contrato Protocol Buffers e se comunicam com um gateway assíncrono
+central. Os dados são persistidos no SQLite e explorados em um dashboard Streamlit.
 
-## Sumário
+> **Status:** projeto acadêmico e de portfólio para execução local. A arquitetura
+> demonstra integração e resiliência, mas ainda não oferece autenticação nem
+> criptografia suficientes para uso em uma rede não confiável.
 
-1. [Arquitetura](#arquitetura)
-2. [Stack Tecnológico](#stack-tecnológico)
-3. [Quick Start](#quick-start)
-4. [Serviços e Portas](#serviços-e-portas)
-5. [Variáveis de Ambiente](#variáveis-de-ambiente)
-6. [Catálogo de Métricas](#catálogo-de-métricas)
-7. [Protocolo de Comunicação](#protocolo-de-comunicação)
-8. [Frota Multi-Dispositivo](#frota-multi-dispositivo)
-9. [Operações do Dashboard](#operações-do-dashboard)
-10. [Resiliência de Rede](#resiliência-de-rede)
-11. [Estrutura do Projeto](#estrutura-do-projeto)
+![Dashboard do laboratório Smart City](docs/assets/dashboard.png)
 
----
+## Por que este projeto é relevante
+
+- integra uma frota poliglota por meio de um único contrato Protobuf;
+- separa telemetria e descoberta por UDP do controle e das consultas por TCP;
+- aplica concorrência com `asyncio`, goroutines, threads POSIX/JVM/Python e loop Lua;
+- implementa framing binário, idempotência, backpressure, retry com jitter e heartbeat;
+- mantém séries históricas no SQLite com WAL, ledger transacional, retenção e rollups;
+- limita janelas e pontos de consultas OLAP antes de enviar dados ao dashboard;
+- oferece operação individual de dispositivos e feedback explícito dos comandos;
+- automatiza validação, testes, builds e smoke test no GitHub Actions.
 
 ## Arquitetura
 
-O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclusivamente com o Gateway central.
+```mermaid
+flowchart LR
+    subgraph Sensores
+        C[Clima · C]
+        L[Postes · Lua]
+        J[Semáforos · Java]
+        P[Câmeras · Python]
+        GO[Estacionamentos · Go]
+    end
 
-```
-                         Docker Network: smart_city_net
-┌────────────────────────────────────────────────────────────────────┐
-│                                                                    │
-│  ┌──────────────────┐   UDP :5000 (Telemetria)                    │
-│  │  sensor_clima    │──────────────────────────────┐              │
-│  │  C · 3 Estações  │   UDP :5002 (Descoberta)     │              │
-│  │  Pici/Benf/Poran.│──────────────────────────────┤              │
-│  └──────────────────┘                              ▼              │
-│                                          ┌──────────────────────┐ │
-│  ┌──────────────────┐   UDP :5000 ──────▶│      gateway         │ │
-│  │  sensor_posto    │   UDP :5002 ──────▶│  Python / asyncio    │ │
-│  │  Lua · 3 Postes  │◀── TCP :5002 ──────│                      │ │
-│  └──────────────────┘                    │  SQLite WAL          │ │
-│                                          │  Pool aiosqlite      │ │
-│  ┌──────────────────┐   UDP :5000 ──────▶│  Framing TCP         │ │
-│  │  sensor_semaforo │   UDP :5002 ──────▶│                      │ │
-│  │  Java · 3 Semáf. │◀── TCP :5003 ──────│  :5000/UDP ingestão  │ │
-│  └──────────────────┘                    │  :5002/UDP descoberta│ │
-│                                          │  :5001/TCP cliente   │ │
-│  ┌──────────────────┐   UDP :5000 ──────▶└──────────────────────┘ │
-│  │  sensor_camera   │   UDP :5002 ──────▶          ▲              │
-│  │  Python · 3 Câm. │◀── TCP :5004 ──────          │ TCP :5001    │
-│  └──────────────────┘                    ┌──────────────────────┐ │
-│                                          │     dashboard        │ │
-│  ←── Multicast 239.0.0.1 ────────────────│  Streamlit :8501     │ │
-│       Recovery Probes (UDP :5000)        └──────────────────────┘ │
-└────────────────────────────────────────────────────────────────────┘
-                                                    │ :8501
-                                                    ▼
-                                              Navegador Web
+    C & L & J & P & GO -->|telemetria e descoberta · UDP| G[Gateway · asyncio]
+    G -->|controle · TCP| L & J & P & GO
+    G <--> DB[(SQLite · WAL e rollups)]
+    D[Dashboard · Streamlit] <-->|consultas e comandos · TCP| G
 ```
 
-### Fluxo de dados
+O gateway é a única fronteira de persistência e coordenação. O endereço anunciado
+por um sensor é tratado como dado não confiável; para controle, o gateway utiliza o
+IP de origem observado no datagrama de descoberta.
 
-| Fase | Protocolo | Descrição |
-|------|-----------|-----------|
-| **Registro** | UDP :5002 | Sensor envia `DiscoveryResponse` → Gateway persiste dispositivo no SQLite |
-| **Telemetria** | UDP :5000 | Sensor envia `DataPayload` com métricas → Gateway valida, desduplicando e persiste |
-| **Controle** | TCP :500x | Dashboard envia `ConfigCommand` via Gateway → Gateway faz proxy para sensor alvo |
-| **Analítica** | TCP :5001 | Dashboard requisita agregação OLAP → Gateway processa e retorna escalar |
-| **Recuperação** | Multicast | Gateway transmite probe → Sensores re-enviam `DiscoveryResponse` |
+O ledger `(device_id, message_id)` e o checkpoint de ordem por dispositivo são
+confirmados junto com métricas e rollups, evitando duplicação após retransmissões
+ou reinicializações. O worker repete lotes quando a escrita falha. Os IDs expiram
+somente se `MESSAGE_MAX_AGE_SECS > 0`; com zero, permanecem no ledger.
 
----
+| Serviço | Runtime | Dispositivos padrão | Domínio | Controle |
+|---|---|---:|---|---:|
+| `sensor_clima` | C | 6 | clima e qualidade ambiental | — |
+| `sensor_posto` | Lua | 3 | luminosidade e consumo | `5006/TCP` |
+| `sensor_java` | Java 21 | 3 | fluxo e fila veicular | `5003/TCP` |
+| `sensor_camera` | Python 3.11 | 3 | tráfego e infrações | `5004/TCP` |
+| `sensor_estacionamento` | Go 1.23 | 3 | ocupação e rotatividade de vagas | `5007/TCP` |
 
-## Stack Tecnológico
+As portas de controle permanecem apenas na rede interna do Compose. No host, o
+dashboard e as interfaces do gateway são publicados em `127.0.0.1` por padrão.
 
-| Componente | Linguagem | Runtime | Biblioteca principal |
-|-----------|-----------|---------|---------------------|
-| Gateway | Python 3.11 | asyncio | `aiosqlite`, `protobuf` |
-| Dashboard | Python 3.11 | Streamlit | `protobuf`, `pandas` |
-| Sensor Clima | C (C11) | POSIX/pthreads | `protobuf-c` |
-| Sensor Poste | Lua 5.4 | LuaSocket | `lua-protobuf` |
-| Sensor Semáforo | Java 17 | JVM | `protobuf-java` |
-| Sensor Câmera | Python 3.11 | threading | `protobuf` |
-| Serialização | — | — | Protocol Buffers 3 |
-| Persistência | — | — | SQLite 3 (WAL mode) |
-| Orquestração | — | Docker Compose | — |
+## Novo sensor: estacionamento inteligente em Go
 
----
+O nó Go simula os estacionamentos **Centro**, **Campus** e **Hospital**. Cada
+dispositivo pode ser ligado, desligado ou ter sua frequência alterada de 1 a 60
+segundos, sem afetar os demais dispositivos do mesmo processo.
 
-## Quick Start
+Métricas publicadas:
 
-### Pré-requisitos
+- `total_spaces`, `occupied_spaces` e `available_spaces`;
+- `occupancy_rate` em percentual;
+- `vehicle_turnover` em veículos por minuto.
 
-- [Docker Engine](https://docs.docker.com/engine/install/) >= 24
-- [Docker Compose](https://docs.docker.com/compose/install/) plugin v2
+A simulação preserva a invariante
+`occupied_spaces + available_spaces = total_spaces`. O servidor de controle possui
+limite de clientes, deadline por conexão, validação temporal, rejeição de replay e
+encerramento gracioso. Veja a [implementação](projeto-sockets/sensor_go/main.go) e os
+[testes](projeto-sockets/sensor_go/main_test.go).
 
-### Executar o sistema completo
+## Início rápido
+
+Pré-requisitos: Docker Engine com Compose v2 ou uma configuração compatível do
+Podman. Não é necessário instalar os cinco runtimes no host.
 
 ```bash
-# Build e inicialização de todos os serviços
-docker compose up --build
+git clone https://github.com/lucas-ferre/projeto_socket.git
+cd projeto_socket/projeto-sockets
+docker compose config --quiet
+docker compose up --build --detach --wait
+```
 
-# Modo background
-docker compose up --build -d
+Abra <http://127.0.0.1:8501>. Para acompanhar ou encerrar o laboratório:
 
-# Acompanhar logs em tempo real
-docker compose logs -f gateway sensor_clima sensor_posto
-
-# Parar tudo
+```bash
+docker compose ps
+docker compose logs --follow gateway dashboard sensor_estacionamento
 docker compose down
 ```
 
-### Acessar o dashboard
+O volume `gateway_db` preserva o histórico. Para remover também os dados simulados,
+use conscientemente `docker compose down --volumes`.
 
-Após a inicialização (aguarde o healthcheck do gateway ser aprovado):
+Em `SIGTERM`/`SIGINT`, o gateway para de admitir entradas e tenta drenar a fila
+antes de fechar o banco. O prazo padrão é 20 segundos
+(`TELEMETRY_SHUTDOWN_TIMEOUT_SECS`), com 45 segundos de tolerância no Compose.
+Prazo excedido ou falha final de escrita geram erro no log e podem perder pacotes
+que ainda estavam em memória.
 
-```
-http://localhost:8501
-```
-
-### Inspecionar o banco de dados
+### Configuração
 
 ```bash
-# Dispositivos registrados
-docker exec gateway sqlite3 db/smartcity_gateway.db \
-  "SELECT device_id, type, status, last_seen FROM devices;"
-
-# Métricas mais recentes
-docker exec gateway sqlite3 db/smartcity_gateway.db \
-  "SELECT device_id, metric_name, value, unit FROM metrics ORDER BY id DESC LIMIT 20;"
+cp .env.example .env
 ```
 
----
+No PowerShell:
 
-## Serviços e Portas
-
-### Expostas ao host
-
-| Serviço | Porta | Protocolo | Descrição |
-|---------|-------|-----------|-----------|
-| `gateway` | **5000** | UDP | Ingestão de telemetria contínua |
-| `gateway` | **5001** | TCP | Interface cliente (dashboard) |
-| `dashboard` | **8501** | TCP/HTTP | Interface web Streamlit |
-
-### Internas (Docker network)
-
-| Serviço | Porta | Protocolo | Descrição |
-|---------|-------|-----------|-----------|
-| `gateway` | 5002 | UDP | Recepção de handshakes de descoberta |
-| `sensor_posto` | 5002 | TCP | Servidor de controle (Lua) |
-| `sensor_semaforo` | 5003 | TCP | Servidor de controle (Java) |
-| `sensor_camera` | 5004 | TCP | Servidor de controle (Python) |
-| Multicast | 5000 | UDP | Grupo 239.0.0.1 — probes de recovery |
-
-> O sensor C não possui porta TCP — opera exclusivamente como emissor UDP.
-
----
-
-## Variáveis de Ambiente
-
-Configure no `docker-compose.yml` sob a chave `environment:` de cada serviço.
-
-### sensor_posto (Lua)
-
-| Variável | Padrão | Descrição |
-|----------|--------|-----------|
-| `LUA_DEVICE_COUNT` | `3` | Número de postes simulados |
-
-### sensor_semaforo (Java)
-
-| Variável | Padrão | Descrição |
-|----------|--------|-----------|
-| `JAVA_DEVICE_COUNT` | `3` | Número de semáforos simulados |
-
-### sensor_camera (Python)
-
-| Variável | Padrão | Descrição |
-|----------|--------|-----------|
-| `CAMERA_DEVICE_COUNT` | `3` | Número de câmeras simuladas |
-
-### gateway
-
-| Variável | Padrão | Descrição |
-|----------|--------|-----------|
-| `DB_POOL_SIZE` | `4` | Tamanho do pool de conexões SQLite |
-
----
-
-## Catálogo de Métricas
-
-Todas as métricas são transmitidas como campos `Metric { name, value, unit }` dentro do `DataPayload`.
-
-### Sensor Clima — sensor_clima (C)
-
-Simula 3 estações ambientais nos setores Pici, Benfica e Porangabussu.
-
-| Métrica | Unidade | Faixa simulada | Descrição |
-|---------|---------|---------------|-----------|
-| `temperature` | °C | 25 – 35 | Temperatura do ar |
-| `humidity` | % | 55 – 90 | Umidade relativa |
-| `co2` | ppm | 400 – 600 | Concentração de CO₂ |
-| `pm25` | µg/m³ | 5 – 45 | Material particulado fino (PM2.5) |
-| `pm10` | µg/m³ | pm25 + 5–25 | Material particulado grosso (PM10) |
-| `aqi` | índice | 0 – 500 | Índice de Qualidade do Ar (padrão EPA) |
-
-**Referência AQI (EPA):**
-`0–50` Bom · `51–100` Moderado · `101–150` Insalubre (sensíveis) · `151–200` Insalubre · `201–300` Muito insalubre · `>300` Perigoso
-
-### Sensor Poste — sensor_posto (Lua)
-
-Simula 3 postes inteligentes com controle de luminosidade.
-
-| Métrica | Unidade | Faixa simulada | Descrição |
-|---------|---------|---------------|-----------|
-| `luminosity` | % | 75 – 100 | Intensidade da iluminação |
-| `power_consumption` | W | 25 – 35 | Consumo elétrico instantâneo |
-
-### Sensor Semáforo — sensor_semaforo (Java)
-
-Simula 3 semáforos com ciclo operacional configurável.
-
-| Métrica | Unidade | Valor | Descrição |
-|---------|---------|-------|-----------|
-| `state` | code | `1` | Estado do ciclo (emitido apenas quando STATUS_ON) |
-
-### Sensor Câmera — sensor_camera (Python)
-
-Simula 3 câmeras de tráfego com detecção de infrações.
-
-| Métrica | Unidade | Faixa simulada | Descrição |
-|---------|---------|---------------|-----------|
-| `vehicles_count` | veh/min | 12 – 95 | Veículos detectados por minuto |
-| `infractions` | count | 0 – ~5 | Infrações registradas no intervalo |
-
-> Taxa de infrações: ~2.5% por veículo (fator 1.8× em pico de tráfego acima de 55 veh/min).
-
----
-
-## Protocolo de Comunicação
-
-### Serialização
-
-Todos os pacotes usam **Protocol Buffers 3** definidos em `common/messages.proto`.
-
-Mensagens principais:
-
-| Mensagem | Direção | Canal |
-|----------|---------|-------|
-| `DiscoveryResponse` | Sensor → Gateway | UDP :5002 |
-| `DataPayload` | Sensor → Gateway | UDP :5000 |
-| `ConfigCommand` | Gateway → Sensor | TCP :500x |
-| `ConfigResponse` | Sensor → Gateway | TCP :500x |
-| `ClientRequest` | Dashboard → Gateway | TCP :5001 |
-| `ClientResponse` | Gateway → Dashboard | TCP :5001 |
-
-### Framing TCP (Length-Prefix)
-
-Toda comunicação TCP usa prefixo de 4 bytes Big-Endian:
-
-```
-┌────────────────┬──────────────────────────────┐
-│  4 bytes (>I)  │  N bytes (Protobuf payload)  │
-│  uint32 BE     │                              │
-└────────────────┴──────────────────────────────┘
+```powershell
+Copy-Item .env.example .env
 ```
 
-### Idempotência
+As quantidades de dispositivos, os limites de entrada e a janela analítica podem
+ser alterados no `.env`. Mantenha `BIND_ADDRESS=127.0.0.1` durante o desenvolvimento.
+A referência completa está em [Operações](docs/operations.md).
 
-Cada mensagem carrega `message_id` único. O gateway detecta e descarta:
-- **Mensagens duplicadas** — mesmo `device_id` + `timestamp` + `message_id`
-- **Mensagens atrasadas** — `timestamp` anterior ao último processado do mesmo dispositivo
+## Dashboard
 
----
+O cliente oferece quatro fluxos:
 
-## Frota Multi-Dispositivo
+1. **Fontes de dados:** inventário e presença da frota descoberta;
+2. **Painel de atuação:** status e frequência por dispositivo controlável;
+3. **Consultas analíticas:** média, desvio-padrão e variação máxima por intervalo;
+4. **Inspeção individual:** série temporal e eventos de um dispositivo.
 
-Cada nó sensor pode simular múltiplos dispositivos independentes no mesmo container,
-distribuídos pelos 3 setores disponíveis: **Pici**, **Benfica** e **Porangabussu**.
+Toda requisição recebe identificador e timestamp. Comandos inválidos são recusados
+antes da mutação, e consultas excessivas são limitadas a 30 dias e 2.000 pontos por
+padrão.
 
-```yaml
-# Exemplo: escalar para 6 câmeras (2 por setor)
-sensor_camera:
-  environment:
-    - CAMERA_DEVICE_COUNT=6
+O gateway devolve o `message_id` da requisição para correlação no cliente e confere
+o ID, estado e frequência das confirmações de atuação. A fonte OLAP considera
+duração e retenção do período consultado; buckets das bordas podem ampliar a
+janela, explicitada nos metadados do resultado.
+
+## Validação
+
+As regressões de gateway, dashboard e sensor Python usam banco temporário e
+sockets locais. Prepare um ambiente Python com `protoc` disponível; os comandos
+abaixo partem da raiz do repositório:
+
+```bash
+cd projeto-sockets
+python -m pip install -r gateway/requirements.txt -r client/requirements.txt -r sensor_python/requirements.txt
+protoc -I=common --python_out=gateway common/messages.proto
+protoc -I=common --python_out=client common/messages.proto
+protoc -I=common --python_out=sensor_python common/messages.proto
+python -m unittest discover -s tests -v
+python -m unittest discover -s sensor_python -p 'test_*.py' -v
 ```
 
-Cada dispositivo da frota:
-- Recebe `device_id` único com sufixo hex aleatório (ex.: `camera_pici_a3f1`)
-- Mantém estado independente (status, frequência de envio)
-- É registrado individualmente no Gateway
-- Pode ser controlado individualmente pelo dashboard
+O teste C do AQI e detalhes da preparação estão em [Operações](docs/operations.md#validação-e-testes)
+e [Setup](SETUP.md#5-validações-antes-de-uma-contribuição).
 
-**Ciclo de status automático:**
+O sensor Go é validado com:
 
-| Status | Probabilidade |
-|--------|--------------|
-| `STATUS_ON` | 78% |
-| `STATUS_OFF` | 12% |
-| `STATUS_ERROR` | 10% |
-
-Após receber um comando manual, o status fica **bloqueado por 30 segundos** antes de retomar a variação automática.
-
----
-
-## Operações do Dashboard
-
-### Aba 1 — Fontes de Dados
-
-Consulta todos os dispositivos registrados no gateway.
-
-Exibe: ID, setor, tipo, status, endereço de controle, controlável, último contato.
-
-### Aba 2 — Painel de Atuação
-
-Envia comandos de configuração para dispositivos controláveis.
-
-| Campo | Opções |
-|-------|--------|
-| Dispositivo alvo | Selecionado entre os controláveis registrados |
-| Novo status | `STATUS_ON`, `STATUS_OFF`, `STATUS_ERROR` (rótulos contextuais por tipo) |
-| Frequência | Intervalo entre envios UDP (1–60 segundos) |
-
-Fluxo: `Dashboard → ClientRequest(SEND_COMMAND) → Gateway (TCP :5001) → Sensor alvo (TCP :500x) → ConfigResponse`
-
-### Aba 3 — Consultas Analíticas (OLAP)
-
-O processamento estatístico ocorre inteiramente no gateway. O cliente recebe apenas o escalar resultante.
-
-| Operação | Enum | Descrição |
-|----------|------|-----------|
-| Média Aritmética | `OP_AVERAGE` | Média simples sobre a janela temporal |
-| Desvio Padrão | `OP_STD_DEV` | Dispersão em relação à média |
-
-Parâmetros:
-- **Métrica alvo** — 11 disponíveis (ver catálogo acima)
-- **Janela temporal** — últimas 1 a 24 horas
-
----
-
-## Resiliência de Rede
-
-### Retry com backoff exponencial + jitter
-
-Todos os sensores implementam retentativas com atraso crescente em UDP e DNS:
-
-```
-Tentativa 1 →  200 ms + jitter aleatório
-Tentativa 2 →  400 ms + jitter aleatório
-Tentativa 3 →  800 ms + jitter aleatório  (máx. 1500 ms)
+```bash
+cd projeto-sockets/sensor_go
+go mod verify
+go vet ./...
+go test ./...
 ```
 
-### Redescoberta automática (Multicast Recovery)
+O build da imagem também executa `go test -race -mod=readonly ./...`. O workflow de
+CI valida o Compose, compila os módulos Python, executa os testes, constrói os sete
+serviços e realiza um smoke test no endpoint de saúde do dashboard. A preparação
+gera os bindings Python nos três diretórios e instala seus manifestos; o teste C
+do AQI também é executado no CI.
 
-O gateway transmite `SMARTCITY_DISCOVERY_PROBE` via multicast `239.0.0.1:5000` a cada 10 segundos.
-Todos os sensores escutam o grupo e re-enviam `DiscoveryResponse`, garantindo recuperação após reinicialização do gateway sem intervenção manual.
+## Documentação
 
-### Jitter de telemetria
+| Documento | Conteúdo |
+|---|---|
+| [Índice técnico](docs/README.md) | mapa do código e fontes de verdade |
+| [Arquitetura](docs/architecture.md) | componentes, fluxos, concorrência e persistência |
+| [Protocolo](docs/protocol.md) | mensagens, framing, portas, validações e evolução |
+| [Operações](docs/operations.md) | configuração, observabilidade, testes e diagnóstico |
+| [Setup](SETUP.md) | preparação detalhada do ambiente |
+| [Segurança](SECURITY.md) | modelo de ameaça e limites conhecidos |
+| [Contribuição](CONTRIBUTING.md) | critérios para mudanças verificáveis |
 
-Cada ciclo de envio inclui atraso aleatório (até ±350 ms) para evitar sincronização de envios em frotas grandes e reduzir colisões UDP.
+## Estrutura
 
-### Graceful Shutdown
-
-| Sensor | Mecanismo |
-|--------|-----------|
-| C | `sigaction(SIGTERM/SIGINT)` → cancela thread POSIX → libera sockets e DNS |
-| Python | `signal.signal` → `threading.Event` → threads daemon encerram com o processo |
-| Java | threads separadas; encerramento natural no `System.exit` |
-| Lua | event-loop síncrono; sem shutdown explícito necessário |
-
----
-
-## Estrutura do Projeto
-
-```
-projeto-sockets/
-│
-├── common/
-│   └── messages.proto          # Contrato Protobuf compartilhado entre todos os serviços
-│
-├── gateway/
-│   ├── main.py                 # Hub central asyncio + aiosqlite + pool de conexões
-│   └── Dockerfile
-│
-├── client/
-│   ├── app.py                  # Dashboard Streamlit (descoberta, controle, OLAP)
-│   └── Dockerfile
-│
-├── sensor_c/
-│   ├── sensor.c                # Estação ambiental POSIX/pthreads — 6 métricas + AQI (EPA)
-│   └── Dockerfile
-│
-├── sensor_lua/
-│   ├── sensor.lua              # Poste inteligente — event-loop cooperativo multi-dispositivo
-│   └── Dockerfile              # Compila messages.pb via protoc no build
-│
-├── sensor_java/
-│   ├── sensor.java             # Semáforo JVM — threads separadas para TCP, multicast e telemetria
-│   └── Dockerfile              # Build multi-estágio JDK 17 → JRE slim
-│
-├── sensor_python/
-│   ├── sensor.py               # Câmera de tráfego — threading + shutdown via Event
-│   └── Dockerfile
-│
-└── docker-compose.yml          # Orquestração com healthcheck e depends_on condicional
+```text
+.
+├── .github/workflows/ci.yml
+├── docs/
+├── CONTRIBUTING.md
+├── SECURITY.md
+├── SETUP.md
+└── projeto-sockets/
+    ├── common/messages.proto
+    ├── gateway/
+    ├── client/
+    ├── sensor_c/
+    ├── sensor_lua/
+    ├── sensor_java/
+    ├── sensor_python/
+    ├── sensor_go/
+    ├── tests/
+    └── docker-compose.yml
 ```
 
----
+## Escopo de segurança
 
-## Notas de Implementação
+O projeto possui limites de frame e datagrama, validação de enums, campos, métricas
+e timestamps, deduplicação, proteção contra replay local e publicação de portas no
+loopback. Ainda assim, UDP e TCP não são autenticados nem criptografados. Não exponha
+o laboratório diretamente à Internet. Para evolução além do ambiente acadêmico,
+consulte [SECURITY.md](SECURITY.md).
 
-- **SQLite WAL mode** ativado no boot para melhorar concorrência de leituras simultâneas
-- **Pool de conexões** (`SQLiteConnectionPool`) com fila asyncio evita bloqueio do event loop em picos de telemetria
-- **Sensor C multi-frota** registra e envia telemetria para N dispositivos no mesmo processo, com `pthread` dedicada ao listener multicast
-- **Sensor Lua** implementa scheduling cooperativo manual (sem threads) via `socket.sleep` e timestamps de controle
-- **Sensor Java** usa `volatile` nos campos de estado para segurança entre threads sem overhead de `synchronized` completo
-- **Healthcheck** garante que o TCP :5001 do gateway responda antes de os sensores iniciarem — elimina race conditions na inicialização do compose# projeto_socket
+## Decisões mantidas em aberto
+
+Conforme o planejamento do projeto, duas decisões serão tomadas após esta rodada:
+
+- **ponto 1 — estratégia definitiva de build:** manter Dockerfiles por serviço,
+  consolidar o fallback ou adotar outra organização;
+- **ponto 9 — licença:** escolher a licença compatível com o objetivo do portfólio.
+
+Até a escolha do ponto 9, a ausência de um arquivo `LICENSE` significa que não há
+uma permissão aberta de reutilização concedida pelo repositório.

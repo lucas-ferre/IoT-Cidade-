@@ -13,15 +13,11 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <stdatomic.h>
-#include <stdbool.h>
-
-/* Substituímos protobuf-c por nanopb */
-#include "messages.pb.h"
-#include <pb_encode.h>
-#include <pb_decode.h>
+#include "messages.pb-c.h"
+#include "aqi.h"
 
 #define GATEWAY_HOST           "gateway"
-char GATEWAY_TELEMETRY_PORT[16] = "5000";
+#define GATEWAY_TELEMETRY_PORT "5000"
 #define GATEWAY_DISCOVERY_PORT "5002"
 #define MULTICAST_GROUP        "239.0.0.1"
 #define MULTICAST_PORT         5005
@@ -60,23 +56,17 @@ double           heartbeat_jitter_secs   = HEARTBEAT_JITTER_SECS;
 int         device_count = 3;
 char        global_device_ids     [DEVICE_COUNT_MAX][64];
 const char *global_device_sectors [DEVICE_COUNT_MAX];
-smartcity_DeviceStatus global_device_statuses[DEVICE_COUNT_MAX];
-int global_device_coord_x[DEVICE_COUNT_MAX];
-int global_device_coord_y[DEVICE_COUNT_MAX];
+Smartcity__DeviceStatus global_device_statuses[DEVICE_COUNT_MAX];
 pthread_mutex_t statuses_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-char global_best_aggregator_ip[64] = GATEWAY_HOST;
-double global_best_aggregator_score = 999999.0;
-pthread_mutex_t router_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 double global_last_threshold_send[DEVICE_COUNT_MAX];  /* single-threaded: main apenas */
 
 atomic_uint global_seq_counter;   /* inicializado em main() via atomic_init() */
 
-static const char *SENSOR_SECTORS[]      = { "Pici", "Benfica", "Porangabussu", "Labomar" };
-static const char *SENSOR_SECTOR_SLUGS[] = { "pici", "benfica", "porangabussu", "labomar" };
-static const int   SENSOR_SECTOR_COUNT   = 4;
+static const char *SENSOR_SECTORS[]      = { "Pici", "Benfica", "Porangabussu" };
+static const char *SENSOR_SECTOR_SLUGS[] = { "pici", "benfica", "porangabussu" };
+static const int   SENSOR_SECTOR_COUNT   = 3;
 static const char *METRIC_NAMES[] = { "temperature", "humidity", "co2",   "pm25",   "pm10",   "aqi"   };
 static const char *METRIC_UNITS[] = {          "C",       "%",   "ppm", "ug/m3", "ug/m3", "index" };
 
@@ -103,21 +93,6 @@ void multicast_socket_cleanup(void *arg) {
 // CÁLCULO DE QUALIDADE DO AR (EPA PM2.5)
 // ====================================================================
 
-static double compute_aqi(double pm25) {
-    static const double c_lo[] = {  0.0,  12.1,  35.5,  55.5, 150.5, 250.5, 350.5 };
-    static const double c_hi[] = { 12.0,  35.4,  55.4, 150.4, 250.4, 350.4, 500.4 };
-    static const int    i_lo[] = {    0,    51,   101,   151,   201,   301,   401  };
-    static const int    i_hi[] = {   50,   100,   150,   200,   300,   400,   500  };
-
-    for (int k = 0; k < 7; k++) {
-        if (pm25 >= c_lo[k] && pm25 <= c_hi[k]) {
-            return ((double)(i_hi[k] - i_lo[k]) / (c_hi[k] - c_lo[k]))
-                   * (pm25 - c_lo[k]) + i_lo[k];
-        }
-    }
-    return 500.0;
-}
-
 static double monotonic_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -128,51 +103,29 @@ static double monotonic_seconds(void) {
 // UTILITÁRIOS
 // ====================================================================
 
-static void get_local_ip(char *ip_buffer, size_t size) {
-    strncpy(ip_buffer, "127.0.0.1", size);
-    
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    if (getaddrinfo(GATEWAY_HOST, "5000", &hints, &res) == 0) {
-        int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-        if (sock >= 0) {
-            connect(sock, res->ai_addr, res->ai_addrlen);
-            struct sockaddr_in local_addr;
-            socklen_t addr_len = sizeof(local_addr);
-            getsockname(sock, (struct sockaddr*)&local_addr, &addr_len);
-            inet_ntop(AF_INET, &local_addr.sin_addr, ip_buffer, size);
-            close(sock);
-        }
-        freeaddrinfo(res);
-    }
-}
-
-static smartcity_DeviceStatus random_device_status(void) {
+static Smartcity__DeviceStatus random_device_status(void) {
     int roll = rand() % 100;
-    if (roll < 78) return smartcity_DeviceStatus_STATUS_ON;
-    if (roll < 90) return smartcity_DeviceStatus_STATUS_OFF;
-    return smartcity_DeviceStatus_STATUS_ERROR;
+    if (roll < 78) return SMARTCITY__DEVICE_STATUS__STATUS_ON;
+    if (roll < 90) return SMARTCITY__DEVICE_STATUS__STATUS_OFF;
+    return SMARTCITY__DEVICE_STATUS__STATUS_ERROR;
 }
 
-static const char *status_to_text(smartcity_DeviceStatus s) {
+static const char *status_to_text(Smartcity__DeviceStatus s) {
     switch (s) {
-        case smartcity_DeviceStatus_STATUS_ON:    return "STATUS_ON";
-        case smartcity_DeviceStatus_STATUS_OFF:   return "STATUS_OFF";
-        case smartcity_DeviceStatus_STATUS_ERROR: return "STATUS_ERROR";
-        default:                                  return "STATUS_UNKNOWN";
+        case SMARTCITY__DEVICE_STATUS__STATUS_ON:    return "STATUS_ON";
+        case SMARTCITY__DEVICE_STATUS__STATUS_OFF:   return "STATUS_OFF";
+        case SMARTCITY__DEVICE_STATUS__STATUS_ERROR: return "STATUS_ERROR";
+        default:                                     return "STATUS_UNKNOWN";
     }
 }
 
 static useconds_t retry_delay_usec(int attempt) {
-    long cap = UDP_RETRY_MAX_USEC;
-    long temp = UDP_RETRY_BASE_USEC;
+    long delay = UDP_RETRY_BASE_USEC;
     for (int i = 0; i < attempt; i++) {
-        temp *= 2;
-        if (temp >= cap) { temp = cap; break; }
+        delay *= 2;
+        if (delay >= UDP_RETRY_MAX_USEC) { delay = UDP_RETRY_MAX_USEC; break; }
     }
-    long delay = rand() % (temp + 1);
+    delay += rand() % UDP_RETRY_BASE_USEC;
     return (useconds_t)delay;
 }
 
@@ -201,21 +154,23 @@ static double heartbeat_delay_secs(void) {
     return heartbeat_interval_secs + jitter;
 }
 
-static void populate_environment_metrics(smartcity_Metric metrics[NUM_METRICS]) {
+static void init_metric_descriptors(Smartcity__Metric metrics[NUM_METRICS],
+                                    Smartcity__Metric *metrics_list[NUM_METRICS]) {
+    for (int i = 0; i < NUM_METRICS; i++) {
+        metrics[i]      = (Smartcity__Metric)SMARTCITY__METRIC__INIT;
+        metrics[i].name = (char *)METRIC_NAMES[i];
+        metrics[i].unit = (char *)METRIC_UNITS[i];
+        metrics_list[i] = &metrics[i];
+    }
+}
+
+static void populate_environment_metrics(Smartcity__Metric metrics[NUM_METRICS]) {
     double temperature = 25.0 + ((double)rand() / RAND_MAX) * 10.0;
     double humidity    = 55.0 + ((double)rand() / RAND_MAX) * 35.0;
     double co2         = 400.0 + ((double)rand() / RAND_MAX) * 200.0;
     double pm25        = 5.0  + ((double)rand() / RAND_MAX) * 40.0;
     double pm10        = pm25  + 5.0 + ((double)rand() / RAND_MAX) * 20.0;
     double aqi         = compute_aqi(pm25);
-
-    for (int i = 0; i < NUM_METRICS; i++) {
-        strncpy(metrics[i].name, METRIC_NAMES[i], sizeof(metrics[i].name) - 1);
-        metrics[i].name[sizeof(metrics[i].name) - 1] = '\0';
-        
-        strncpy(metrics[i].unit, METRIC_UNITS[i], sizeof(metrics[i].unit) - 1);
-        metrics[i].unit[sizeof(metrics[i].unit) - 1] = '\0';
-    }
 
     metrics[0].value = temperature;
     metrics[1].value = humidity;
@@ -225,7 +180,7 @@ static void populate_environment_metrics(smartcity_Metric metrics[NUM_METRICS]) 
     metrics[5].value = aqi;
 }
 
-static const char *environment_threshold_reason(smartcity_Metric metrics[NUM_METRICS],
+static const char *environment_threshold_reason(Smartcity__Metric metrics[NUM_METRICS],
                                                 char *reason,
                                                 size_t reason_size) {
     int written = 0;
@@ -290,33 +245,56 @@ static int send_udp_with_retry(int sockfd,
 
 static int send_environment_payload(int device_idx,
                                     const char *trigger_reason,
-                                    smartcity_DataPayload *payload) {
-    uint8_t buffer[1024]; // Buffer fixo, nanopb dispensa malloc
-    pb_ostream_t stream = pb_ostream_from_buffer(buffer, sizeof(buffer));
+                                    Smartcity__Metric metrics[NUM_METRICS],
+                                    Smartcity__Metric *metrics_list[NUM_METRICS]) {
+    Smartcity__DataPayload payload = SMARTCITY__DATA_PAYLOAD__INIT;
+    char msg_id_buffer[80];
+    time_t now = time(NULL);
 
-    int sent_ok = 0;
+    unsigned int seq = atomic_fetch_add_explicit(&global_seq_counter, 1,
+                                                 memory_order_relaxed);
+    snprintf(msg_id_buffer, sizeof(msg_id_buffer),
+             "%s-%ld-%u", global_device_ids[device_idx], now, seq);
 
-    pthread_mutex_lock(&router_mutex);
-    struct addrinfo *target = global_gateway_telemetry_res;
-    pthread_mutex_unlock(&router_mutex);
+    payload.message_id     = msg_id_buffer;
+    payload.timestamp      = now;
+    payload.device_id      = global_device_ids[device_idx];
 
-    if (pb_encode(&stream, smartcity_DataPayload_fields, payload)) {
-        sent_ok = (send_udp_with_retry(global_sockfd, buffer, stream.bytes_written,
-                                       target,
-                                       "Telemetria") == 0);
+    pthread_mutex_lock(&statuses_mutex);
+    payload.current_status = global_device_statuses[device_idx];
+    pthread_mutex_unlock(&statuses_mutex);
+
+    if (payload.current_status == SMARTCITY__DEVICE_STATUS__STATUS_ON) {
+        payload.n_metrics = NUM_METRICS;
+        payload.metrics   = metrics_list;
     } else {
-        fprintf(stderr, "[Sensor C:Erro] Falha de encode nanopb para telemetria: %s\n", PB_GET_ERROR(&stream));
+        payload.n_metrics = 0;
+        payload.metrics   = NULL;
     }
 
-    if (sent_ok && payload->current_status == smartcity_DeviceStatus_STATUS_ON) {
+    size_t   len = smartcity__data_payload__get_packed_size(&payload);
+    uint8_t *buf = malloc(len);
+    int      sent_ok = 0;
+
+    if (buf) {
+        smartcity__data_payload__pack(&payload, buf);
+        sent_ok = (send_udp_with_retry(global_sockfd, buf, len,
+                                       global_gateway_telemetry_res,
+                                       "Telemetria") == 0);
+        free(buf);
+    } else {
+        fprintf(stderr, "[Sensor C:Erro] Falha de alocação para telemetria.\n");
+    }
+
+    if (sent_ok && payload.current_status == SMARTCITY__DEVICE_STATUS__STATUS_ON) {
         printf("[Sensor C:UDP] %s | Dispositivo=%s | Setor=%s | Status=%s | ID=%s | "
                "Temp=%.1f°C  UR=%.0f%%  CO\xE2\x82\x82=%.0fppm  "
                "PM2.5=%.1f  PM10=%.1f  AQI=%.0f%s\n",
                trigger_reason ? "Evento por limiar" : "Telemetria injetada",
                global_device_ids[device_idx], global_device_sectors[device_idx],
-               status_to_text(payload->current_status), payload->message_id,
-               payload->metrics[0].value, payload->metrics[1].value, payload->metrics[2].value,
-               payload->metrics[3].value, payload->metrics[4].value, payload->metrics[5].value,
+               status_to_text(payload.current_status), msg_id_buffer,
+               metrics[0].value, metrics[1].value, metrics[2].value,
+               metrics[3].value, metrics[4].value, metrics[5].value,
                trigger_reason ? " | Limiar detectado" : "");
         if (trigger_reason) {
             printf("[Sensor C:Limiar] Dispositivo=%s | %s\n",
@@ -325,10 +303,10 @@ static int send_environment_payload(int device_idx,
     } else if (sent_ok) {
         printf("[Sensor C:UDP] Heartbeat | Dispositivo=%s | Setor=%s | Status=%s\n",
                global_device_ids[device_idx], global_device_sectors[device_idx],
-               status_to_text(payload->current_status));
+               status_to_text(payload.current_status));
     } else {
         fprintf(stderr, "[Sensor C:Erro] Telemetria ID=%s descartada após retries.\n",
-                payload->message_id);
+                msg_id_buffer);
     }
 
     return sent_ok;
@@ -340,7 +318,7 @@ static void poll_threshold_events(void) {
     /* global_last_threshold_send: acesso sem mutex — single-threaded (main apenas). */
     for (int device_idx = 0; device_idx < device_count; device_idx++) {
         pthread_mutex_lock(&statuses_mutex);
-        int is_on = (global_device_statuses[device_idx] == smartcity_DeviceStatus_STATUS_ON);
+        int is_on = (global_device_statuses[device_idx] == SMARTCITY__DEVICE_STATUS__STATUS_ON);
         pthread_mutex_unlock(&statuses_mutex);
 
         if (!is_on)
@@ -349,29 +327,16 @@ static void poll_threshold_events(void) {
         if ((now_mono - global_last_threshold_send[device_idx]) < THRESHOLD_EVENT_COOLDOWN_SECS)
             continue;
 
-        smartcity_DataPayload payload = smartcity_DataPayload_init_zero;
-        
-        unsigned int seq = atomic_fetch_add_explicit(&global_seq_counter, 1, memory_order_relaxed);
-        time_t now = time(NULL);
-        snprintf(payload.message_id, sizeof(payload.message_id),
-                 "%s-%ld-%u", global_device_ids[device_idx], (long)now, seq);
-
-        payload.timestamp = (int64_t)now;
-        strncpy(payload.device_id, global_device_ids[device_idx], sizeof(payload.device_id) - 1);
-        
-        pthread_mutex_lock(&statuses_mutex);
-        payload.current_status = global_device_statuses[device_idx];
-        pthread_mutex_unlock(&statuses_mutex);
-
-        payload.metrics_count = NUM_METRICS;
-        populate_environment_metrics(payload.metrics);
-
+        Smartcity__Metric  metrics[NUM_METRICS];
+        Smartcity__Metric *metrics_list[NUM_METRICS];
         char reason[192];
-        const char *trigger_reason = environment_threshold_reason(payload.metrics, reason, sizeof(reason));
-        
-        if (trigger_reason != NULL) {
+
+        init_metric_descriptors(metrics, metrics_list);
+        populate_environment_metrics(metrics);
+
+        if (environment_threshold_reason(metrics, reason, sizeof(reason)) != NULL) {
             global_last_threshold_send[device_idx] = now_mono;
-            send_environment_payload(device_idx, trigger_reason, &payload);
+            send_environment_payload(device_idx, reason, metrics, metrics_list);
         }
     }
 }
@@ -431,42 +396,38 @@ void send_discovery_announcement(void) {
     }
 
     for (int i = 0; i < device_count; i++) {
+        char disc_msg_id[80];
         time_t disc_now = time(NULL);
-
-        smartcity_DiscoveryResponse disc = smartcity_DiscoveryResponse_init_zero;
-        snprintf(disc.message_id, sizeof(disc.message_id),
+        snprintf(disc_msg_id, sizeof(disc_msg_id),
                  "DISC-%s-%ld", global_device_ids[i], (long)disc_now);
 
+        Smartcity__DiscoveryResponse disc = SMARTCITY__DISCOVERY_RESPONSE__INIT;
+        disc.message_id      = disc_msg_id;
         disc.timestamp       = (int64_t)disc_now;
-        strncpy(disc.device_id, global_device_ids[i], sizeof(disc.device_id) - 1);
-        disc.type            = smartcity_DeviceType_DEVICE_TYPE_WEATHER_STATION;
-        strncpy(disc.ip_address, g_self_hostname, sizeof(disc.ip_address) - 1);
+        disc.device_id       = global_device_ids[i];
+        disc.type            = SMARTCITY__DEVICE_TYPE__DEVICE_TYPE_WEATHER_STATION;
+        disc.ip_address      = g_self_hostname;    /* [Fix 3] global, não static local */
 
         pthread_mutex_lock(&statuses_mutex);
         disc.initial_status  = global_device_statuses[i];
-        smartcity_DeviceStatus status = global_device_statuses[i];
+        Smartcity__DeviceStatus status = global_device_statuses[i];
         pthread_mutex_unlock(&statuses_mutex);
 
-        disc.is_controllable = false;
+        disc.is_controllable = 0;
         disc.control_port    = 0;
-        disc.coord_x         = global_device_coord_x[i];
-        disc.coord_y         = global_device_coord_y[i];
 
-        uint8_t buffer[512]; // Nanopb: buffer estático para o handshake
-        pb_ostream_t stream = pb_ostream_from_buffer(buffer, sizeof(buffer));
-
-        if (!pb_encode(&stream, smartcity_DiscoveryResponse_fields, &disc)) {
-            fprintf(stderr, "[Sensor C:Erro] Falha de encode na descoberta de %s: %s\n",
-                    global_device_ids[i], PB_GET_ERROR(&stream));
+        size_t packed_size = smartcity__discovery_response__get_packed_size(&disc);
+        uint8_t *buffer = malloc(packed_size);
+        if (!buffer) {
+            fprintf(stderr, "[Sensor C:Erro] Falha de alocação na descoberta de %s.\n",
+                    global_device_ids[i]);
             continue;
         }
 
-        pthread_mutex_lock(&router_mutex);
-        struct addrinfo *target = global_gateway_discovery_res;
-        pthread_mutex_unlock(&router_mutex);
+        smartcity__discovery_response__pack(&disc, buffer);
 
-        if (send_udp_with_retry(disc_sock, buffer, stream.bytes_written,
-                                target, "Descoberta") == 0) {
+        if (send_udp_with_retry(disc_sock, buffer, packed_size,
+                                global_gateway_discovery_res, "Descoberta") == 0) {
             printf("[Sensor C:Descoberta] Dispositivo=%s | Setor=%s | Status=%s"
                    " | Handshake emitido via porta %s.\n",
                    global_device_ids[i], global_device_sectors[i],
@@ -475,6 +436,7 @@ void send_discovery_announcement(void) {
             fprintf(stderr, "[Sensor C:Erro] Descoberta de %s descartada após retries.\n",
                     global_device_ids[i]);
         }
+        free(buffer);
     }
 
     close(disc_sock);
@@ -539,115 +501,16 @@ void *multicast_listener_thread(void *arg) {
         }
         if (n > 0) {
             buffer[n] = '\0';
-            smartcity_AggregatorLoad loadMsg = smartcity_AggregatorLoad_init_zero;
-            pb_istream_t stream = pb_istream_from_buffer((uint8_t*)buffer, n);
-            if (pb_decode(&stream, smartcity_AggregatorLoad_fields, &loadMsg)) {
-                if (strcmp(loadMsg.aggregator_id, "GATEWAY_PROBE") == 0) {
-                    printf("[Sensor C:Thread] Probe interceptado — re-sincronizando topologia com jitter.\n");
-                    wait_discovery_probe_jitter();
-                    send_discovery_announcement();
-                } else {
-                    double score = (loadMsg.cpu_load * 0.4) + (loadMsg.queue_size * 0.6);
-                    
-                    pthread_mutex_lock(&router_mutex);
-                    if (score < global_best_aggregator_score || strcmp(global_best_aggregator_ip, loadMsg.ip_address) == 0) {
-                        if (strcmp(global_best_aggregator_ip, loadMsg.ip_address) != 0) {
-                            printf("[Sensor C:LoadBalancer] Rota alterada para %s (Score: %.2f -> %.2f)\n", 
-                                loadMsg.aggregator_id, global_best_aggregator_score, score);
-                            strncpy(global_best_aggregator_ip, loadMsg.ip_address, sizeof(global_best_aggregator_ip) - 1);
-                            
-                            // Re-resolver DNS para o novo IP
-                            struct addrinfo hints;
-                            memset(&hints, 0, sizeof(hints));
-                            hints.ai_family = AF_INET;
-                            hints.ai_socktype = SOCK_DGRAM;
-                            
-                            struct addrinfo *new_tel = NULL, *new_disc = NULL;
-                            if (getaddrinfo(global_best_aggregator_ip, GATEWAY_TELEMETRY_PORT, &hints, &new_tel) == 0) {
-                                if (global_gateway_telemetry_res) freeaddrinfo(global_gateway_telemetry_res);
-                                global_gateway_telemetry_res = new_tel;
-                            }
-                            if (getaddrinfo(global_best_aggregator_ip, GATEWAY_DISCOVERY_PORT, &hints, &new_disc) == 0) {
-                                if (global_gateway_discovery_res) freeaddrinfo(global_gateway_discovery_res);
-                                global_gateway_discovery_res = new_disc;
-                            }
-                        }
-                        global_best_aggregator_score = score;
-                    }
-                    pthread_mutex_unlock(&router_mutex);
-                }
+            if (strcmp(buffer, "SMARTCITY_DISCOVERY_PROBE") == 0) {
+                printf("[Sensor C:Thread] Probe interceptado — re-sincronizando topologia com jitter.\n");
+                wait_discovery_probe_jitter();
+                send_discovery_announcement();
             }
         }
     }
 
     pthread_cleanup_pop(1);
     return NULL;
-}
-
-static int authenticate_with_gateway() {
-    printf("[sensor_clima] | [Auth] Iniciando autenticacao TCP com Gateway (%s:5007)...\n", GATEWAY_HOST);
-    sleep(1);
-    
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(GATEWAY_HOST, "5007", &hints, &res) != 0) {
-        fprintf(stderr, "[sensor_clima] | [Auth] Falha no DNS.\n");
-        exit(EXIT_FAILURE);
-    }
-    
-    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    struct timeval tv = {10, 0};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-    
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        fprintf(stderr, "[sensor_clima] | [Auth] Erro ao conectar ao Gateway.\n");
-        exit(EXIT_FAILURE);
-    }
-    
-    smartcity_AuthRequest req = smartcity_AuthRequest_init_zero;
-    strncpy(req.device_id, global_device_ids[0], sizeof(req.device_id) - 1);
-    req.type = smartcity_DeviceType_DEVICE_TYPE_WEATHER_STATION;
-    const char *lic = getenv("SENSOR_LICENSE_PART");
-    strncpy(req.license_key_part, lic ? lic : "V1-FULL", sizeof(req.license_key_part) - 1);
-    strncpy(req.hex_service_code, "0C", sizeof(req.hex_service_code) - 1);
-    
-    uint8_t buffer[512];
-    pb_ostream_t stream = pb_ostream_from_buffer(buffer, sizeof(buffer));
-    pb_encode(&stream, smartcity_AuthRequest_fields, &req);
-    
-    uint32_t len_net = htonl((uint32_t)stream.bytes_written);
-    send(sock, &len_net, 4, 0);
-    send(sock, buffer, stream.bytes_written, 0);
-    
-    uint32_t resp_len_net;
-    if (recv(sock, &resp_len_net, 4, MSG_WAITALL) != 4) {
-        fprintf(stderr, "[sensor_clima] | [Auth] Falha ao receber cabecalho TCP.\n");
-        exit(EXIT_FAILURE);
-    }
-    uint32_t resp_len = ntohl(resp_len_net);
-    
-    uint8_t resp_buffer[512];
-    if (recv(sock, resp_buffer, resp_len, MSG_WAITALL) != resp_len) {
-        fprintf(stderr, "[sensor_clima] | [Auth] Falha ao receber payload TCP.\n");
-        exit(EXIT_FAILURE);
-    }
-    
-    smartcity_AuthResponse resp = smartcity_AuthResponse_init_zero;
-    pb_istream_t in_stream = pb_istream_from_buffer(resp_buffer, resp_len);
-    pb_decode(&in_stream, smartcity_AuthResponse_fields, &resp);
-    
-    if (!resp.success) {
-        fprintf(stderr, "[sensor_clima] | [Auth] FALHA na validacao: %s\n", resp.message);
-        exit(EXIT_FAILURE);
-    }
-    
-    printf("[Auth] Gateway encontrado! Tipo: sensor_clima, Chave: '%s-0C'. Validação: SUCESSO. Porta alocada e conectada: %d.\n", lic ? lic : "V1-FULL", (int)resp.assigned_port);
-    
-    close(sock);
-    freeaddrinfo(res);
-    return resp.assigned_port;
 }
 
 // ====================================================================
@@ -660,12 +523,12 @@ int main(void) {
     atomic_init(&global_seq_counter, 0);
 
     if (gethostname(g_self_hostname, sizeof(g_self_hostname)) != 0) {
-        get_local_ip(g_self_hostname, sizeof(g_self_hostname));
+        strncpy(g_self_hostname, "sensor_clima", sizeof(g_self_hostname) - 1);
+        g_self_hostname[sizeof(g_self_hostname) - 1] = '\0';
         fprintf(stderr, "[Sensor C:Config] gethostname() falhou — usando fallback '%s'.\n",
                 g_self_hostname);
     }
-    get_local_ip(g_self_hostname, sizeof(g_self_hostname));
-    printf("[Sensor C:Config] IP resolvido: '%s'.\n", g_self_hostname);
+    printf("[Sensor C:Config] Hostname resolvido: '%s'.\n", g_self_hostname);
 
     heartbeat_interval_secs = read_env_double("SENSOR_HEARTBEAT_INTERVAL_SECS",
                                               HEARTBEAT_INTERVAL_SECS, 1.0);
@@ -696,21 +559,7 @@ int main(void) {
         int sector_idx = i % SENSOR_SECTOR_COUNT;
         int sector_ordinal = (i / SENSOR_SECTOR_COUNT) + 1;
         global_device_sectors [i] = SENSOR_SECTORS[sector_idx];
-        global_device_statuses[i] = smartcity_DeviceStatus_STATUS_ON;
-        
-        int cx = 0, cy = 0;
-        if (strcmp(SENSOR_SECTOR_SLUGS[sector_idx], "pici") == 0) {
-            cx = rand() % 41; cy = rand() % 61;
-        } else if (strcmp(SENSOR_SECTOR_SLUGS[sector_idx], "benfica") == 0) {
-            cx = 50 + (rand() % 41); cy = rand() % 31;
-        } else if (strcmp(SENSOR_SECTOR_SLUGS[sector_idx], "porangabussu") == 0) {
-            cx = 60 + (rand() % 41); cy = 50 + (rand() % 41);
-        } else { // labomar
-            cx = rand() % 31; cy = 70 + (rand() % 31);
-        }
-        global_device_coord_x[i] = cx;
-        global_device_coord_y[i] = cy;
-
+        global_device_statuses[i] = SMARTCITY__DEVICE_STATUS__STATUS_ON;
         snprintf(global_device_ids[i], sizeof(global_device_ids[i]),
                  "estacao_%s_%02d", SENSOR_SECTOR_SLUGS[sector_idx], sector_ordinal);
         printf("           [%d] Dispositivo=%-24s | Setor=%s\n",
@@ -756,63 +605,12 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    /* Thread de escuta Multicast — g_self_hostname é read-only a partir daqui */
-    if (pthread_create(&listener_tid, NULL, multicast_listener_thread, NULL) != 0)
-        perror("[Sensor C:Aviso] Falha ao criar thread Multicast");
-
-    /* Console IDLE de status embutido (opt-in via SENSOR_IDLE_CONSOLE).
-     * Somente leitura — a estação de clima é não-controlável por projeto. */
-    {
-        const char *idle_env = getenv("SENSOR_IDLE_CONSOLE");
-        if (idle_env && (strcmp(idle_env, "1") == 0 || strcmp(idle_env, "true") == 0 ||
-                         strcmp(idle_env, "yes") == 0 || strcmp(idle_env, "on") == 0)) {
-            extern void *console_idle_thread(void *);
-            pthread_t console_tid;
-            if (pthread_create(&console_tid, NULL, console_idle_thread, NULL) == 0) {
-                pthread_detach(console_tid);
-                printf("[Sensor C:IDLE] Console de status embutido ativo (use 'docker attach').\n");
-            } else {
-                fprintf(stderr, "[Sensor C:IDLE] Falha ao criar thread do console.\n");
-            }
-        }
-    }
-
-    printf("[Sensor C] Aguardando broadcast de AggregatorLoad para descobrir IP real...\n");
-    while (keep_running) {
-        pthread_mutex_lock(&router_mutex);
-        int is_default = (strcmp(global_best_aggregator_ip, GATEWAY_HOST) == 0);
-        pthread_mutex_unlock(&router_mutex);
-        if (!is_default) break;
-        usleep(100000);
-    }
-
     /* Handshake topológico inicial — g_self_hostname já está inicializado */
     send_discovery_announcement();
 
-    int assigned_port = authenticate_with_gateway();
-    snprintf(GATEWAY_TELEMETRY_PORT, sizeof(GATEWAY_TELEMETRY_PORT), "%d", assigned_port);
-    
-    sleep(2);
-    
-    if (global_gateway_telemetry_res) freeaddrinfo(global_gateway_telemetry_res);
-    
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    if (resolve_gateway_with_retry(GATEWAY_TELEMETRY_PORT,
-                                   &hints, &global_gateway_telemetry_res,
-                                   "Telemetria") != 0) {
-        fprintf(stderr, "[Sensor C:Erro] Falha ao resolver DNS de Telemetria Pos-Auth.\n");
-        exit(EXIT_FAILURE);
-    }
-
-    global_sockfd = socket(global_gateway_telemetry_res->ai_family,
-                           global_gateway_telemetry_res->ai_socktype,
-                           global_gateway_telemetry_res->ai_protocol);
-    if (global_sockfd < 0) {
-        perror("[Sensor C:Erro] Falha na criação do socket de telemetria pos-auth");
-        exit(EXIT_FAILURE);
-    }
+    /* Thread de escuta Multicast — g_self_hostname é read-only a partir daqui */
+    if (pthread_create(&listener_tid, NULL, multicast_listener_thread, NULL) != 0)
+        perror("[Sensor C:Aviso] Falha ao criar thread Multicast");
 
     double next_heartbeat_at = monotonic_seconds() + heartbeat_delay_secs();
 
@@ -827,38 +625,27 @@ int main(void) {
         for (int device_idx = 0; device_idx < device_count; device_idx++) {
             pthread_mutex_lock(&statuses_mutex);
             global_device_statuses[device_idx] = random_device_status();
-            smartcity_DeviceStatus current_status = global_device_statuses[device_idx];
+            Smartcity__DeviceStatus current_status = global_device_statuses[device_idx];
             pthread_mutex_unlock(&statuses_mutex);
 
-            smartcity_DataPayload payload = smartcity_DataPayload_init_zero;
-            time_t now = time(NULL);
-            unsigned int seq = atomic_fetch_add_explicit(&global_seq_counter, 1, memory_order_relaxed);
-            snprintf(payload.message_id, sizeof(payload.message_id),
-                     "%s-%ld-%u", global_device_ids[device_idx], (long)now, seq);
+            Smartcity__Metric  metrics[NUM_METRICS];
+            Smartcity__Metric *metrics_list[NUM_METRICS];
+            char reason[192];
 
-            payload.timestamp = (int64_t)now;
-            strncpy(payload.device_id, global_device_ids[device_idx], sizeof(payload.device_id) - 1);
-            payload.current_status = current_status;
-            payload.coord_x = global_device_coord_x[device_idx];
-            payload.coord_y = global_device_coord_y[device_idx];
+            init_metric_descriptors(metrics, metrics_list);
+            populate_environment_metrics(metrics);
 
             const char *threshold_reason = NULL;
-            if (current_status == smartcity_DeviceStatus_STATUS_ON) {
-                payload.metrics_count = NUM_METRICS;
-                populate_environment_metrics(payload.metrics);
-
-                char reason[192];
-                threshold_reason = environment_threshold_reason(payload.metrics, reason, sizeof(reason));
-                
+            if (current_status == SMARTCITY__DEVICE_STATUS__STATUS_ON) {
+                threshold_reason = environment_threshold_reason(
+                    metrics, reason, sizeof(reason));
                 if (threshold_reason != NULL) {
                     /* global_last_threshold_send: single-threaded — sem mutex */
                     global_last_threshold_send[device_idx] = monotonic_seconds();
                 }
-            } else {
-                payload.metrics_count = 0; // Desligado, não envia métricas
             }
 
-            send_environment_payload(device_idx, threshold_reason, &payload);
+            send_environment_payload(device_idx, threshold_reason, metrics, metrics_list);
         }
 
         sleep_with_threshold_scans(SLEEP_INTERVAL_SECS);

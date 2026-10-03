@@ -1,0 +1,5 @@
+# Dependências importadas diretamente pelo dashboard em Python 3.11.
+pandas>=2.1.0,<3.0
+protobuf>=4.25.0,<7.0
+streamlit>=1.30.0,<2.0
+

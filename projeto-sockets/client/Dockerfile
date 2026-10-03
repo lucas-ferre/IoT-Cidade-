@@ -7,8 +7,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# 2. Instala os pacotes Python de renderização visual e desserialização
-RUN pip install --no-cache-dir streamlit protobuf requests pandas asks trio redis
+# 2. Instala as dependências diretas declaradas pelo dashboard
+COPY ./client/requirements.txt ./client/requirements.txt
+RUN python -m pip install --no-cache-dir --requirement ./client/requirements.txt \
+    && python -m pip check
 
 # 3. Copia o código da interface e o esquema centralizado (Single Source of Truth)
 COPY ./client ./client

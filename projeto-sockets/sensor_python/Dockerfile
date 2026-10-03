@@ -6,7 +6,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir protobuf cryptography
+COPY ./sensor_python/requirements.txt ./sensor_python/requirements.txt
+RUN python -m pip install --no-cache-dir --requirement ./sensor_python/requirements.txt \
+    && python -m pip check
 
 COPY ./sensor_python ./sensor_python
 COPY ./common ./common

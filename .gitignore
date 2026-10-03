@@ -1,0 +1,64 @@
+# Operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors and local workspace settings
+.idea/
+.vscode/
+*.code-workspace
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.preview-*/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated Protocol Buffers artifacts
+**/messages_pb2.py
+**/messages_pb2.pyi
+**/messages.pb
+**/messages.pb-c.c
+**/messages.pb-c.h
+**/smartcity/Messages.java
+
+# Compiled artifacts
+*.class
+*.jar
+*.o
+*.obj
+*.exe
+*.out
+
+# Go
+*.test
+*.prof
+coverage.out
+projeto-sockets/sensor_go/proto/
+projeto-sockets/sensor_go/sensor_go
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+projeto-sockets/gateway/db/
+
+# Build and test output
+build/
+dist/
+coverage/

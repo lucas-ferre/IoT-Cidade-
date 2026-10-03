@@ -7,8 +7,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Instalação das bibliotecas Python de runtime (incluindo aiosqlite)
-RUN pip install --no-cache-dir protobuf aiosqlite redis cryptography
+# Instala primeiro o manifesto para aproveitar o cache de dependências do build.
+COPY ./gateway/requirements.txt ./gateway/requirements.txt
+RUN python -m pip install --no-cache-dir --requirement ./gateway/requirements.txt \
+    && python -m pip check
 
 # Injeção do código do serviço e do contrato de dados centralizado
 COPY ./gateway ./gateway
