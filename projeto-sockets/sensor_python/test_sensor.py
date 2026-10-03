@@ -1,4 +1,5 @@
 import concurrent.futures
+import math
 import os
 import socket
 import struct
@@ -8,6 +9,37 @@ import unittest
 from unittest.mock import patch
 
 import sensor
+
+
+class CameraTelemetryTests(unittest.TestCase):
+    def test_fleet_distributes_nine_unique_cameras_across_sectors(self):
+        devices = sensor.build_device_fleet(9)
+        self.assertEqual(len(devices), 9)
+        for slug in ("pici", "benfica", "porangabussu"):
+            for ordinal in range(1, 4):
+                self.assertIn(f"camera_{slug}_{ordinal:02d}", devices)
+
+    def test_traffic_readings_remain_physically_consistent(self):
+        expected_units = {
+            "vehicles_count": "veh/min", "infractions": "count",
+            "average_speed": "km/h", "road_occupancy": "%",
+            "accidents": "count", "pedestrians_count": "pedestrians/min",
+            "detection_confidence": "%", "heavy_vehicles_count": "veh/min",
+        }
+        for _ in range(500):
+            metrics = sensor.build_traffic_metrics()
+            self.assertEqual({m.name: m.unit for m in metrics}, expected_units)
+            self.assertEqual(len(metrics), len(expected_units))
+            values = {m.name: m.value for m in metrics}
+            self.assertTrue(all(math.isfinite(v) and v >= 0 for v in values.values()))
+            self.assertLessEqual(values["infractions"], values["vehicles_count"])
+            self.assertLessEqual(values["heavy_vehicles_count"], values["vehicles_count"])
+            self.assertGreaterEqual(values["average_speed"], 8.0)
+            self.assertLessEqual(values["average_speed"], 70.0)
+            self.assertGreaterEqual(values["road_occupancy"], 0.0)
+            self.assertLessEqual(values["road_occupancy"], 100.0)
+            self.assertGreaterEqual(values["detection_confidence"], 85.0)
+            self.assertLessEqual(values["detection_confidence"], 99.8)
 
 
 class CameraControlTests(unittest.TestCase):

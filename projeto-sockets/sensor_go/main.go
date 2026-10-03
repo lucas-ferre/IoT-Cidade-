@@ -112,6 +112,11 @@ type parkingDevice struct {
 	totalSpaces     int
 	occupiedSpaces  int
 	vehicleTurnover float64
+	arrivals        int
+	departures      int
+	averageWait     float64
+	hourlyRevenue   float64
+	evCharging      int
 }
 
 type deviceSnapshot struct {
@@ -122,6 +127,11 @@ type deviceSnapshot struct {
 	totalSpaces     int
 	occupiedSpaces  int
 	vehicleTurnover float64
+	arrivals        int
+	departures      int
+	averageWait     float64
+	hourlyRevenue   float64
+	evCharging      int
 }
 
 type fleet struct {
@@ -156,7 +166,9 @@ func newFleet(deviceCount int, random *lockedRandom) *fleet {
 			nextSendAt:      now,
 			totalSpaces:     capacity,
 			occupiedSpaces:  occupied,
-			vehicleTurnover: 0.2 + random.float64()*1.3,
+			vehicleTurnover: 0,
+			hourlyRevenue:   float64(occupied) * 3.5,
+			evCharging:      clamp(occupied/12, 0, capacity/20),
 		}
 		f.order = append(f.order, deviceID)
 	}
@@ -173,6 +185,11 @@ func snapshotOf(device *parkingDevice) deviceSnapshot {
 		totalSpaces:     device.totalSpaces,
 		occupiedSpaces:  device.occupiedSpaces,
 		vehicleTurnover: device.vehicleTurnover,
+		arrivals:        device.arrivals,
+		departures:      device.departures,
+		averageWait:     device.averageWait,
+		hourlyRevenue:   device.hourlyRevenue,
+		evCharging:      device.evCharging,
 	}
 }
 
@@ -197,27 +214,27 @@ func (f *fleet) snapshots(targetDeviceID string) []deviceSnapshot {
 
 func (f *fleet) evolve(device *parkingDevice) {
 	occupancyRatio := float64(device.occupiedSpaces) / float64(device.totalSpaces)
-	draw := f.random.float64()
-	delta := 0
-
-	switch {
-	case draw < 0.38:
-		delta = 0
-	case occupancyRatio >= 0.90:
-		delta = -(1 + f.random.intn(2))
-	case occupancyRatio <= 0.15:
-		delta = 1 + f.random.intn(2)
-	case f.random.intn(2) == 0:
-		delta = -(1 + f.random.intn(2))
-	default:
-		delta = 1 + f.random.intn(2)
+	device.departures = clamp(f.random.intn(3), 0, device.occupiedSpaces)
+	arrivalDemand := f.random.intn(3)
+	if occupancyRatio <= 0.15 {
+		arrivalDemand++
 	}
-
-	device.occupiedSpaces = clamp(device.occupiedSpaces+delta, 0, device.totalSpaces)
-	// A rotatividade expressa uma taxa estimada e suavizada, não apenas a
-	// diferença líquida de ocupação (uma chegada e uma saída podem se anular).
-	targetTurnover := 0.2 + f.random.float64()*2.3
+	availableAfterDepartures := device.totalSpaces - device.occupiedSpaces + device.departures
+	device.arrivals = clamp(arrivalDemand, 0, availableAfterDepartures)
+	device.occupiedSpaces += device.arrivals - device.departures
+	// Fluxos são contagens no intervalo da leitura. Rotatividade é sua taxa
+	// suavizada; uma chegada e uma saída também contam quando o saldo é zero.
+	intervalSeconds := math.Max(1, float64(device.frequencySecs))
+	targetTurnover := float64(device.arrivals+device.departures) * 60 / intervalSeconds
 	device.vehicleTurnover = (device.vehicleTurnover * 0.65) + (targetTurnover * 0.35)
+	occupancyRatio = float64(device.occupiedSpaces) / float64(device.totalSpaces)
+	device.averageWait = math.Max(0, occupancyRatio-0.80) * 60
+	device.hourlyRevenue = float64(device.occupiedSpaces) * 3.5
+	evCapacity := device.totalSpaces / 20
+	if evCapacity > device.occupiedSpaces {
+		evCapacity = device.occupiedSpaces
+	}
+	device.evCharging = clamp(device.occupiedSpaces/12+f.random.intn(3), 0, evCapacity)
 }
 
 func (f *fleet) dueSnapshots(now time.Time) []deviceSnapshot {
@@ -235,6 +252,8 @@ func (f *fleet) dueSnapshots(now time.Time) []deviceSnapshot {
 			f.evolve(device)
 		} else {
 			device.vehicleTurnover = 0
+			device.arrivals = 0
+			device.departures = 0
 		}
 
 		frequency := time.Duration(device.frequencySecs) * time.Second
@@ -476,6 +495,12 @@ func parkingMetrics(snapshot deviceSnapshot) []*smartcitypb.Metric {
 		{Name: "available_spaces", Value: float64(available), Unit: "spaces"},
 		{Name: "occupancy_rate", Value: occupancyRate, Unit: "%"},
 		{Name: "vehicle_turnover", Value: snapshot.vehicleTurnover, Unit: "vehicles/min"},
+		{Name: "arrivals", Value: float64(snapshot.arrivals), Unit: "vehicles"},
+		{Name: "departures", Value: float64(snapshot.departures), Unit: "vehicles"},
+		{Name: "parking_wait_time", Value: snapshot.averageWait, Unit: "min"},
+		{Name: "hourly_revenue", Value: snapshot.hourlyRevenue, Unit: "BRL/h"},
+		{Name: "ev_charging_vehicles", Value: float64(snapshot.evCharging), Unit: "vehicles"},
+		{Name: "ev_charging_power", Value: float64(snapshot.evCharging) * 7.2, Unit: "kW"},
 	}
 }
 
@@ -802,7 +827,7 @@ func writeAll(writer io.Writer, payload []byte) error {
 }
 
 func loadConfiguration() (configuration, error) {
-	deviceCount, err := boundedEnvInt("GO_PARKING_DEVICE_COUNT", 3, 1, 100)
+	deviceCount, err := boundedEnvInt("GO_PARKING_DEVICE_COUNT", 9, 1, 100)
 	if err != nil {
 		return configuration{}, err
 	}

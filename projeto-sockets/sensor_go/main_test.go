@@ -79,6 +79,10 @@ func TestFleetAppliesCommandPerDeviceAndRejectsReplay(t *testing.T) {
 
 func TestParkingMetricsRemainConsistent(t *testing.T) {
 	s := newSensor(configuration{deviceCount: 3}, nil)
+	previous := make(map[string]int)
+	for _, snapshot := range s.fleet.snapshots("") {
+		previous[snapshot.id] = snapshot.occupiedSpaces
+	}
 	for iteration := 0; iteration < 250; iteration++ {
 		snapshots := s.fleet.dueSnapshots(time.Now().Add(time.Duration(iteration) * time.Minute))
 		for _, snapshot := range snapshots {
@@ -93,8 +97,8 @@ func TestParkingMetricsRemainConsistent(t *testing.T) {
 			}
 
 			metrics := parkingMetrics(snapshot)
-			if len(metrics) != 5 {
-				t.Fatalf("quantidade de métricas=%d; esperado 5", len(metrics))
+			if len(metrics) != 11 {
+				t.Fatalf("quantidade de métricas=%d; esperado 11", len(metrics))
 			}
 			if metrics[0].GetName() != "total_spaces" ||
 				metrics[1].GetName() != "occupied_spaces" ||
@@ -105,6 +109,26 @@ func TestParkingMetricsRemainConsistent(t *testing.T) {
 			}
 			if metrics[1].GetValue()+metrics[2].GetValue() != metrics[0].GetValue() {
 				t.Fatalf("ocupadas + disponíveis diverge do total: %v", metrics)
+			}
+			if snapshot.occupiedSpaces != previous[snapshot.id]+snapshot.arrivals-snapshot.departures {
+				t.Fatalf("fluxo não conserva ocupação para %s: %+v", snapshot.id, snapshot)
+			}
+			previous[snapshot.id] = snapshot.occupiedSpaces
+			if snapshot.evCharging < 0 || snapshot.evCharging > snapshot.totalSpaces/20 || snapshot.evCharging > snapshot.occupiedSpaces {
+				t.Fatalf("carga EV excede capacidade: %+v", snapshot)
+			}
+			values := make(map[string]float64)
+			for _, metric := range metrics {
+				if _, duplicated := values[metric.GetName()]; duplicated {
+					t.Fatalf("métrica repetida: %s", metric.GetName())
+				}
+				if metric.GetValue() < 0 || metric.GetUnit() == "" {
+					t.Fatalf("métrica inválida: %v", metric)
+				}
+				values[metric.GetName()] = metric.GetValue()
+			}
+			if values["ev_charging_power"] != values["ev_charging_vehicles"]*7.2 {
+				t.Fatalf("potência EV inconsistente: %v", values)
 			}
 		}
 	}
@@ -134,6 +158,24 @@ func TestLengthPrefixedFrameRoundTrip(t *testing.T) {
 	}
 	if !proto.Equal(got, want) {
 		t.Fatalf("resposta divergente: got=%v want=%v", got, want)
+	}
+}
+
+func TestParkingFlowAtEmptyAndFullCapacity(t *testing.T) {
+	f := newFleet(3, newLockedRandom())
+	for _, initial := range []int{0, 80} {
+		device := &parkingDevice{totalSpaces: 80, occupiedSpaces: initial, frequencySecs: 5}
+		for iteration := 0; iteration < 500; iteration++ {
+			previous := device.occupiedSpaces
+			f.evolve(device)
+			if device.occupiedSpaces != previous+device.arrivals-device.departures ||
+				device.occupiedSpaces < 0 || device.occupiedSpaces > device.totalSpaces {
+				t.Fatalf("fluxo inconsistente no limite: %+v", device)
+			}
+			if device.evCharging > device.occupiedSpaces || device.evCharging > device.totalSpaces/20 {
+				t.Fatalf("recarga EV sem veículo ou sem vaga: %+v", device)
+			}
+		}
 	}
 }
 

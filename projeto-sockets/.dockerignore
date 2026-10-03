@@ -16,6 +16,10 @@
 **/*.log
 .env
 .preview-*
+**/.preview-*
+**/.build-tools
+**/target
+**/node_modules
 .env.*
 !.env.example
 documentação

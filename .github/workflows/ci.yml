@@ -37,14 +37,14 @@ jobs:
       - name: Prepare Python tests and Protobuf bindings
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-          python -m pip install -r gateway/requirements.txt -r client/requirements.txt -r sensor_python/requirements.txt
+          sudo apt-get install -y protobuf-compiler lua5.4
+          python -m pip install -r gateway/requirements.txt -r client/requirements.txt -r sensor_python/requirements.txt -r hubs/requirements.txt -r sensor_intruder/requirements.txt
           protoc -I=common --python_out=gateway common/messages.proto
           protoc -I=common --python_out=client common/messages.proto
           protoc -I=common --python_out=sensor_python common/messages.proto
 
       - name: Validate Python syntax
-        run: python -m compileall -q gateway client sensor_python
+        run: python -m compileall -q gateway client sensor_python hubs sensor_intruder
 
       - name: Run gateway, dashboard and sensor regressions
         run: |
@@ -55,6 +55,46 @@ jobs:
         run: |
           gcc -std=c11 -Wall -Wextra -Werror sensor_c/test_aqi.c -lm -o /tmp/test-aqi
           /tmp/test-aqi
+          gcc -std=c11 -Wall -Wextra -Werror sensor_c/test_environment.c -lm -o /tmp/test-environment
+          /tmp/test-environment
+
+      - name: Validate Lua lamp simulation
+        working-directory: projeto-sockets/sensor_lua
+        run: lua5.4 test_lamp_metrics.lua
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Validate Java traffic simulation
+        working-directory: projeto-sockets/sensor_java
+        run: |
+          javac TrafficSample.java TrafficSampleTest.java
+          java TrafficSampleTest
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate TypeScript and Protobuf compatibility
+        run: |
+          node --experimental-strip-types --test sensor_typescript/tests/*.test.ts
+          python -m unittest discover -s sensor_typescript/tests -p 'test_*.py' -v
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.90.0'
+
+      - name: Validate Rust water sensor
+        working-directory: projeto-sockets/sensor_rust
+        run: |
+          cargo fmt --check
+          cargo test --locked
+          cargo build --locked
 
       - name: Build service images
         run: docker compose build
@@ -64,6 +104,15 @@ jobs:
 
       - name: Check dashboard health endpoint
         run: curl --fail --show-error --retry 10 --retry-delay 2 http://127.0.0.1:8501/_stcore/health
+
+      - name: Check telemetry and Rust control through both hubs
+        run: docker compose exec -T dashboard python smoke.py --expected-devices 66
+
+      - name: Exercise the intruder simulation
+        run: docker compose --profile security-test run --build --rm sensor_invasor
+
+      - name: Verify fleet and data after the intruder simulation
+        run: docker compose exec -T dashboard python smoke.py --expected-devices 66
 
       - name: Show service logs on failure
         if: failure()

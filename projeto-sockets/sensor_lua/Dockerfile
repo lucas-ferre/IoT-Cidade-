@@ -19,6 +19,8 @@ RUN luarocks --lua-version=5.4 install lua-protobuf && \
 WORKDIR /app
 
 COPY ./sensor_lua/sensor.lua .
+COPY ./sensor_lua/lamp_metrics.lua ./sensor_lua/test_lamp_metrics.lua ./
+RUN lua5.4 test_lamp_metrics.lua
 
 COPY ./common/messages.proto .
 

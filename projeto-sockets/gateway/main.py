@@ -142,6 +142,8 @@ VALID_DEVICE_TYPES = frozenset(
         messages_pb2.DEVICE_TYPE_CAMERA,
         messages_pb2.DEVICE_TYPE_AIR_QUALITY,
         messages_pb2.DEVICE_TYPE_PARKING_SENSOR,
+        messages_pb2.DEVICE_TYPE_WATER_SENSOR,
+        messages_pb2.DEVICE_TYPE_WASTE_SENSOR,
     }
 )
 VALID_DEVICE_STATUSES = frozenset(

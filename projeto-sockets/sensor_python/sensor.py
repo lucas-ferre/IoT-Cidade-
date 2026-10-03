@@ -26,7 +26,7 @@ SECTORS = (
     ("Benfica", "benfica"),
     ("Porangabussu", "porangabussu"),
 )
-CAMERA_DEVICE_COUNT = max(1, int(os.getenv("CAMERA_DEVICE_COUNT", str(len(SECTORS)))))
+CAMERA_DEVICE_COUNT = max(1, min(100, int(os.getenv("CAMERA_DEVICE_COUNT", "9"))))
 DEVICE_HOSTNAME = "sensor_camera"
 
 
@@ -214,6 +214,12 @@ def build_traffic_metrics() -> list[messages_pb2.Metric]:
     rush_factor = 1.0 if vehicles_count < 55 else 1.8
     infraction_rate = 0.025 * rush_factor
     infractions = sum(1 for _ in range(vehicles_count) if random.random() < infraction_rate)
+    road_occupancy = min(100.0, vehicles_count / 95.0 * 100.0)
+    average_speed = max(8.0, 65.0 - road_occupancy * 0.5 + random.uniform(-5.0, 5.0))
+    heavy_vehicles_count = sum(1 for _ in range(vehicles_count) if random.random() < 0.12)
+    accidents = random.choices([0, 1, 2], weights=[0.97, 0.025, 0.005], k=1)[0]
+    pedestrians_count = random.randint(0, 65)
+    detection_confidence = random.uniform(85.0, 99.8)
 
     return [
         messages_pb2.Metric(
@@ -226,6 +232,12 @@ def build_traffic_metrics() -> list[messages_pb2.Metric]:
             value=float(infractions),
             unit="count",
         ),
+        messages_pb2.Metric(name="average_speed", value=average_speed, unit="km/h"),
+        messages_pb2.Metric(name="road_occupancy", value=road_occupancy, unit="%"),
+        messages_pb2.Metric(name="accidents", value=float(accidents), unit="count"),
+        messages_pb2.Metric(name="pedestrians_count", value=float(pedestrians_count), unit="pedestrians/min"),
+        messages_pb2.Metric(name="detection_confidence", value=detection_confidence, unit="%"),
+        messages_pb2.Metric(name="heavy_vehicles_count", value=float(heavy_vehicles_count), unit="veh/min"),
     ]
 
 

@@ -1,4 +1,58 @@
 services:
+  hub_sensores:
+    build:
+      context: .
+      dockerfile: hubs/Dockerfile
+    command: ["python", "-m", "hubs.main", "sensores"]
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:5000:5000/udp"
+      - "${BIND_ADDRESS:-127.0.0.1}:5002:5002/udp"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      GATEWAY_HOST: gateway
+      HUB_ID: hub_sensores
+      HUB_RATE_PER_SECOND: "${HUB_RATE_PER_SECOND:-120}"
+      HUB_RATE_BURST: "${HUB_RATE_BURST:-240}"
+      HUB_DEVICE_TTL_SECS: "${HUB_DEVICE_TTL_SECS:-120}"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks: [smart_city_net, gateway_backend]
+    restart: on-failure
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "python", "-m", "hubs.main", "healthcheck", "sensores"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  hub_acesso:
+    build:
+      context: .
+      dockerfile: hubs/Dockerfile
+    command: ["python", "-m", "hubs.main", "acesso"]
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:5001:5001/tcp"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      GATEWAY_HOST: gateway
+      HUB_ID: hub_acesso
+      ACCESS_ALLOWED_HOSTS: "${ACCESS_ALLOWED_HOSTS:-dashboard}"
+      HUB_MAX_CLIENTS: "${HUB_MAX_CLIENTS:-64}"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks: [smart_city_net, gateway_backend]
+    restart: on-failure
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "python", "-m", "hubs.main", "healthcheck", "acesso"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
   # ==================================================================
   # 1. GATEWAY INTELIGENTE (HUB COORDENADOR)
   # ==================================================================
@@ -7,12 +61,6 @@ services:
       context: .
       dockerfile: gateway/Dockerfile
     container_name: gateway
-    ports:
-      # Seguro por padrão: acessível somente a partir do host local.
-      # Consulte ../SECURITY.md antes de alterar BIND_ADDRESS para 0.0.0.0.
-      - "${BIND_ADDRESS:-127.0.0.1}:5000:5000/udp"  # Ingestão de telemetria contínua
-      - "${BIND_ADDRESS:-127.0.0.1}:5001:5001/tcp"  # Interface de streaming analítico e atuação
-      - "${BIND_ADDRESS:-127.0.0.1}:5002:5002/udp"  # Registro de descoberta de sensores externos
     volumes:
       - gateway_db:/app/gateway/db
     environment:
@@ -53,7 +101,7 @@ services:
       MESSAGE_MAX_AGE_SECS: "${MESSAGE_MAX_AGE_SECS:-86400}"
       MESSAGE_MAX_FUTURE_SKEW_SECS: "${MESSAGE_MAX_FUTURE_SKEW_SECS:-300}"
     networks:
-      - smart_city_net
+      - gateway_backend
     restart: always
     # SIGTERM interrompe entradas e drena a fila antes de fechar o SQLite.
     # A margem inclui os 20s de drenagem e o timeout de escrita do banco.
@@ -77,9 +125,10 @@ services:
       dockerfile: sensor_c/Dockerfile
     container_name: sensor_clima
     environment:
-      C_DEVICE_COUNT: "${C_DEVICE_COUNT:-6}"  # Ajustável sem recompilação
+      C_DEVICE_COUNT: "${C_DEVICE_COUNT:-12}"
+      GATEWAY_HOST: hub_sensores
     depends_on:
-      gateway:
+      hub_sensores:
         condition: service_healthy
     networks:
       - smart_city_net
@@ -106,11 +155,12 @@ services:
       dockerfile: sensor_lua/Dockerfile
     container_name: sensor_posto
     environment:
-      LUA_DEVICE_COUNT: "${LUA_DEVICE_COUNT:-3}"
+      LUA_DEVICE_COUNT: "${LUA_DEVICE_COUNT:-9}"
+      GATEWAY_HOST: hub_sensores
       CONTROL_COMMAND_MAX_AGE_SECS: "${CONTROL_COMMAND_MAX_AGE_SECS:-300}"
       CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS: "${CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS:-30}"
     depends_on:
-      gateway:
+      hub_sensores:
         condition: service_healthy
     networks:
       - smart_city_net
@@ -136,11 +186,12 @@ services:
       dockerfile: sensor_java/Dockerfile
     container_name: sensor_semaforo
     environment:
-      JAVA_DEVICE_COUNT: "${JAVA_DEVICE_COUNT:-3}"
+      JAVA_DEVICE_COUNT: "${JAVA_DEVICE_COUNT:-9}"
+      GATEWAY_HOST: hub_sensores
       CONTROL_COMMAND_MAX_AGE_SECS: "${CONTROL_COMMAND_MAX_AGE_SECS:-300}"
       CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS: "${CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS:-30}"
     depends_on:
-      gateway:
+      hub_sensores:
         condition: service_healthy
     networks:
       - smart_city_net
@@ -165,11 +216,12 @@ services:
     container_name: sensor_camera
     environment:
       PYTHONUNBUFFERED: "1"
-      CAMERA_DEVICE_COUNT: "${CAMERA_DEVICE_COUNT:-3}"
+      CAMERA_DEVICE_COUNT: "${CAMERA_DEVICE_COUNT:-9}"
+      GATEWAY_HOST: hub_sensores
       CONTROL_COMMAND_MAX_AGE_SECS: "${CONTROL_COMMAND_MAX_AGE_SECS:-300}"
       CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS: "${CONTROL_COMMAND_MAX_FUTURE_SKEW_SECS:-30}"
     depends_on:
-      gateway:
+      hub_sensores:
         condition: service_healthy
     networks:
       - smart_city_net
@@ -195,14 +247,14 @@ services:
       dockerfile: sensor_go/Dockerfile
     container_name: sensor_estacionamento
     environment:
-      GO_PARKING_DEVICE_COUNT: "${GO_PARKING_DEVICE_COUNT:-3}"
-      GATEWAY_HOST: "gateway"
+      GO_PARKING_DEVICE_COUNT: "${GO_PARKING_DEVICE_COUNT:-9}"
+      GATEWAY_HOST: hub_sensores
       SENSOR_HOSTNAME: "sensor_estacionamento"
       SENSOR_HEARTBEAT_INTERVAL_SECS: "${SENSOR_HEARTBEAT_INTERVAL_SECS:-10}"
       SENSOR_HEARTBEAT_JITTER_SECS: "${SENSOR_HEARTBEAT_JITTER_SECS:-2}"
       SENSOR_DISCOVERY_JITTER_SECS: "${SENSOR_DISCOVERY_JITTER_SECS:-2}"
     depends_on:
-      gateway:
+      hub_sensores:
         condition: service_healthy
     networks:
       - smart_city_net
@@ -215,18 +267,75 @@ services:
       retries: 3
       start_period: 5s
 
-  # ==================================================================
-  # 7. CLIENTE ANALÍTICO (DASHBOARD STREAMLIT)
-  # ==================================================================
+  sensor_agua:
+    build:
+      context: .
+      dockerfile: sensor_rust/Dockerfile
+    environment:
+      GATEWAY_HOST: hub_sensores
+      SENSOR_HOSTNAME: sensor_agua
+      RUST_WATER_DEVICE_COUNT: "${RUST_WATER_DEVICE_COUNT:-9}"
+      SENSOR_HEARTBEAT_INTERVAL_SECS: "${SENSOR_HEARTBEAT_INTERVAL_SECS:-10}"
+    depends_on:
+      hub_sensores:
+        condition: service_healthy
+    networks: [smart_city_net]
+    restart: on-failure
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "/app/sensor-water", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  sensor_lixeiras:
+    build:
+      context: .
+      dockerfile: sensor_typescript/Dockerfile
+    environment:
+      GATEWAY_HOST: hub_sensores
+      SENSOR_HOSTNAME: sensor_lixeiras
+      TS_WASTE_DEVICE_COUNT: "${TS_WASTE_DEVICE_COUNT:-9}"
+    depends_on:
+      hub_sensores:
+        condition: service_healthy
+    networks: [smart_city_net]
+    restart: on-failure
+    stop_grace_period: 10s
+
+  sensor_invasor:
+    profiles: [security-test]
+    build:
+      context: .
+      dockerfile: sensor_intruder/Dockerfile
+    environment:
+      PYTHONUNBUFFERED: "1"
+      INTRUDER_ENABLED: "1"
+      INTRUDER_SENSOR_HUB_HOST: hub_sensores
+      INTRUDER_ACCESS_HUB_HOST: hub_acesso
+      INTRUDER_ROUNDS: "${INTRUDER_ROUNDS:-1}"
+      INTRUDER_INTERVAL_SECS: "${INTRUDER_INTERVAL_SECS:-0.15}"
+    depends_on:
+      hub_sensores:
+        condition: service_healthy
+      hub_acesso:
+        condition: service_healthy
+    networks: [smart_city_net]
+    restart: "no"
+
+  # CLIENTE ANALÍTICO (DASHBOARD STREAMLIT)
   dashboard:
     build:
       context: .
       dockerfile: client/Dockerfile
     container_name: dashboard
+    environment:
+      GATEWAY_HOST: hub_acesso
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:8501:8501"
     depends_on:
-      gateway:
+      hub_acesso:
         condition: service_healthy
     networks:
       - smart_city_net
@@ -243,6 +352,9 @@ services:
       start_period: 10s
 
 networks:
+  gateway_backend:
+    driver: bridge
+    internal: true
   smart_city_net:
     driver: bridge
 

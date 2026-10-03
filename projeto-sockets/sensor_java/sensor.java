@@ -13,10 +13,10 @@ public class sensor {
         {"Benfica", "benfica"},
         {"Porangabussu", "porangabussu"}
     };
-    private static final int DEVICE_COUNT = Math.max(1, Integer.parseInt(System.getenv().getOrDefault("JAVA_DEVICE_COUNT", String.valueOf(SECTORS.length))));
+    private static final int DEVICE_COUNT = Math.max(1, Math.min(100, Integer.parseInt(System.getenv().getOrDefault("JAVA_DEVICE_COUNT", "9"))));
     private static final java.util.Map<String, DeviceState> DEVICES = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.List<String> DEVICE_ORDER = new java.util.concurrent.CopyOnWriteArrayList<>();
-    private static final String GATEWAY_HOST = "gateway";
+    private static final String GATEWAY_HOST = System.getenv().getOrDefault("GATEWAY_HOST", "gateway");
     private static final String DEVICE_HOSTNAME;
     static {
         String h = "sensor_semaforo";
@@ -558,8 +558,15 @@ public class sensor {
             if (queueLength == null) {
                 queueLength = sampleQueueLength();
             }
-            builder.addMetrics(Messages.Metric.newBuilder().setName("state").setValue(1).setUnit("code"));
+            TrafficSample sample = TrafficSample.sample(queueLength, now, device.deviceId.hashCode(), RNG);
+            builder.addMetrics(Messages.Metric.newBuilder().setName("state").setValue(sample.state).setUnit("code"));
             builder.addMetrics(Messages.Metric.newBuilder().setName("queue_length").setValue(queueLength).setUnit("vehicles"));
+            builder.addMetrics(Messages.Metric.newBuilder().setName("average_wait").setValue(sample.averageWait).setUnit("seconds"));
+            builder.addMetrics(Messages.Metric.newBuilder().setName("average_speed").setValue(sample.averageSpeed).setUnit("km/h"));
+            builder.addMetrics(Messages.Metric.newBuilder().setName("road_occupancy").setValue(sample.roadOccupancy).setUnit("%"));
+            builder.addMetrics(Messages.Metric.newBuilder().setName("cycle_duration").setValue(sample.cycleDuration).setUnit("seconds"));
+            builder.addMetrics(Messages.Metric.newBuilder().setName("pedestrians_count").setValue(sample.pedestriansCount).setUnit("pedestrians/min"));
+            builder.addMetrics(Messages.Metric.newBuilder().setName("green_remaining").setValue(sample.greenRemaining).setUnit("seconds"));
         }
 
         Messages.DataPayload p = builder.build();

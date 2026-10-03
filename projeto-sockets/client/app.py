@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 import messages_pb2 # pyright: ignore[reportMissingImports]
 from dashboard_helpers import assess_analytics_value, build_history_chart, build_history_frame
 from gateway_transport import GatewayTcpClient, TcpRequestResult, _GATEWAY_UNAVAILABLE_CODES
+from metric_catalog import DEVICE_METRICS_MAP, METRIC_ICONS, METRIC_OPTIONS, METRIC_UNITS
 
 # ====================================================================
 # CONFIGURAÇÕES DE REDE E TRANSPORTE TCP
@@ -173,6 +174,9 @@ def infer_sector_from_device_id(device_id: str) -> str:
         "pici": "Pici",
         "benfica": "Benfica",
         "porangabussu": "Porangabussu",
+        "centro": "Centro",
+        "campus": "Campus",
+        "hospital": "Hospital",
     }
     
     # Busca relaxada para não quebrar com nomes como "CameraPici01"
@@ -192,42 +196,14 @@ TYPE_MAP = {
     messages_pb2.DEVICE_TYPE_CAMERA: "📹 Câmera de Tráfego",
     messages_pb2.DEVICE_TYPE_AIR_QUALITY: "💨 Qualidade do Ar",
     messages_pb2.DEVICE_TYPE_PARKING_SENSOR: "🅿️ Estacionamento Inteligente",
+    messages_pb2.DEVICE_TYPE_WATER_SENSOR: "🚰 Água e Saneamento (Rust)",
+    messages_pb2.DEVICE_TYPE_WASTE_SENSOR: "🗑️ Lixeira Inteligente (TypeScript)",
 }
 
 STATUS_MAP = {
     messages_pb2.STATUS_ON: "🟢 ONLINE",
     messages_pb2.STATUS_OFF: "⚪ OFFLINE",
     messages_pb2.STATUS_ERROR: "🔴 FALHA"
-}
-
-METRIC_ICONS = {
-    "temperature": "🌡️", "humidity": "💧", "co2": "🌿",
-    "pm25": "🌫️", "pm10": "💨", "aqi": "🏭",
-    "luminosity": "💡", "power_consumption": "⚡", "state": "🚦",
-    "vehicles_count": "🚗", "infractions": "📸", "queue_length": "🚥",
-    "total_spaces": "🅿️", "occupied_spaces": "🚙", "available_spaces": "✅",
-    "occupancy_rate": "📊", "vehicle_turnover": "🔄",
-}
-
-METRIC_UNITS = {
-    "temperature": "°C", "humidity": "%", "co2": "ppm",
-    "pm25": "µg/m³", "pm10": "µg/m³", "aqi": "",
-    "luminosity": "%", "power_consumption": "W", "state": "",
-    "vehicles_count": "veh/min", "infractions": "count", "queue_length": "vehicles",
-    "total_spaces": "spaces", "occupied_spaces": "spaces", "available_spaces": "spaces",
-    "occupancy_rate": "%", "vehicle_turnover": "vehicles/min",
-}
-
-DEVICE_METRICS_MAP = {
-    messages_pb2.DEVICE_TYPE_WEATHER_STATION: ["temperature", "humidity", "co2", "pm25", "pm10", "aqi"],
-    messages_pb2.DEVICE_TYPE_AIR_QUALITY: ["temperature", "humidity", "co2", "pm25", "pm10", "aqi"],
-    messages_pb2.DEVICE_TYPE_LAMP_POST: ["luminosity", "power_consumption"],
-    messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT: ["state", "queue_length"],
-    messages_pb2.DEVICE_TYPE_CAMERA: ["vehicles_count", "infractions"],
-    messages_pb2.DEVICE_TYPE_PARKING_SENSOR: [
-        "total_spaces", "occupied_spaces", "available_spaces",
-        "occupancy_rate", "vehicle_turnover",
-    ],
 }
 
 # ====================================================================
@@ -293,7 +269,8 @@ with st.sidebar:
         st.session_state.gw_last_check = time.time()
 
     gateway_status = "🟢 Ativo" if st.session_state.gw_status else "🔴 Inativo"
-    col1.metric("Gateway", gateway_status)
+    col1.metric("Hub de acesso", gateway_status,
+                help="Disponibilidade do canal TCP; as requisições verificam o gateway interno.")
 
     sensor_count = len(st.session_state.device_history) if st.session_state.device_history else "N/A"
     col2.metric("Sensores", sensor_count, help="Atualizar na aba Descoberta")
@@ -608,24 +585,8 @@ with tab3:
         ], format_func=lambda x: x[0])
 
     with c_met:
-        metrica_alvo = st.selectbox("Vetor de Telemetria", [
-            ("🌡️ Temperatura (°C)",              "temperature"),
-            ("💧 Umidade Relativa (%)",            "humidity"),
-            ("🌿 CO₂ (ppm)",                      "co2"),
-            ("🌫️ PM2.5 — Partículas Finas",      "pm25"),
-            ("💨 PM10 — Partículas Grossas",     "pm10"),
-            ("🏭 AQI — Índice Base EPA",         "aqi"),
-            ("💡 Luxmetria Resultante (%)",      "luminosity"),
-            ("⚡ Drenagem Energética (W)",       "power_consumption"),
-            ("🚗 Fluxo Veicular Direto",         "vehicles_count"),
-            ("📸 Taxa de Infrações Corrente",    "infractions"),
-            ("🚥 Fila Semafórica (veículos)",    "queue_length"),
-            ("🅿️ Total de Vagas",               "total_spaces"),
-            ("🚙 Vagas Ocupadas",               "occupied_spaces"),
-            ("✅ Vagas Disponíveis",            "available_spaces"),
-            ("📊 Taxa de Ocupação (%)",          "occupancy_rate"),
-            ("🔄 Rotatividade de Veículos",      "vehicle_turnover"),
-        ], format_func=lambda x: x[0])
+        metrica_alvo = st.selectbox("Vetor de Telemetria", METRIC_OPTIONS,
+                                    format_func=lambda x: x[0])
 
     with c_time:
         janela_horas = st.slider("Fatia Temporal Histórica (Horas passadas)", min_value=1, max_value=24, value=1)
@@ -740,11 +701,13 @@ with tab3:
         **Métricas disponíveis por sensor:**
         | Sensor | Métricas |
         |--------|----------|
-        | 🌡️ Estação Ambiental (C) | `temperature` · `humidity` · `co2` · `pm25` · `pm10` · `aqi` |
-        | 💡 Poste Inteligente (Lua) | `luminosity` · `power_consumption` |
-        | 🚦 Semáforo (Java) | `state` · `queue_length` |
-        | 📹 Câmera de Tráfego (Python) | `vehicles_count` · `infractions` |
-        | 🅿️ Estacionamento (Go) | `total_spaces` · `occupied_spaces` · `available_spaces` · `occupancy_rate` · `vehicle_turnover` |
+        | 🌡️ Estação Ambiental (C) | 13: clima, ar, vento, pressão, chuva, ruído, visibilidade e UV |
+        | 💡 Poste Inteligente (Lua) | 8: luminosidade, potência, energia, tensão, corrente e estado do LED |
+        | 🚦 Semáforo (Java) | 8: fase, fila, espera, velocidade, ocupação, ciclo, pedestres e tempo de verde |
+        | 📹 Câmera de Tráfego (Python) | 8: fluxo, infrações, velocidade, ocupação, acidentes, pedestres, confiança e veículos pesados |
+        | 🅿️ Estacionamento (Go) | 11: vagas, ocupação, rotatividade, chegadas/saídas, espera, receita e recarga elétrica |
+        | 🚰 Água (Rust) | 8: nível, vazão, pressão, pH, turbidez, temperatura, condutividade e vazamento |
+        | 🗑️ Lixeira (TypeScript) | 9: ocupação, peso, temperatura, umidade, bateria, sinal, coletas, inclinação e aquecimento |
 
         **Referência de qualidade do ar (AQI — EPA):**
         `0–50` Bom · `51–100` Moderado · `101–150` Insalubre (sensíveis) ·

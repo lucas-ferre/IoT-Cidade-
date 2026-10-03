@@ -20,6 +20,8 @@ __pycache__/
 .venv/
 venv/
 .preview-*/
+**/target/
+**/node_modules/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

@@ -1,5 +1,6 @@
 local socket = require("socket")
 local pb     = require("pb")
+local LampMetrics = require("lamp_metrics")
 
 print("============================================================")
 print("[Sensor Lua] Inicializando Poste Inteligente (Arquitetura Multiplexada)...")
@@ -46,7 +47,7 @@ local THRESHOLD_SCAN_INTERVAL_SECS   = 1.0
 local THRESHOLD_EVENT_COOLDOWN_SECS  = 3.0
 local LUMINOSITY_LOW_THRESHOLD    = tonumber(os.getenv("LUMINOSITY_LOW_THRESHOLD")    or "80")
 local POWER_CONSUMPTION_THRESHOLD = tonumber(os.getenv("POWER_CONSUMPTION_THRESHOLD") or "32")
-local DEVICE_COUNT                = tonumber(os.getenv("LUA_DEVICE_COUNT") or tostring(#SECTORS))
+local DEVICE_COUNT                = math.max(1, math.min(100, math.floor(tonumber(os.getenv("LUA_DEVICE_COUNT") or "9") or 9)))
 local GATEWAY_DNS_CACHE_TTL_SECS  = math.max(1.0, tonumber(os.getenv("GATEWAY_DNS_CACHE_TTL_SECS") or "15") or 15.0)
 local GATEWAY_DNS_RETRY_SECS      = math.max(0.5, tonumber(os.getenv("GATEWAY_DNS_RETRY_SECS") or "1") or 1.0)
 
@@ -82,7 +83,11 @@ for idx = 1, DEVICE_COUNT do
         next_jitter_secs     = math.random() * TELEMETRY_JITTER_SECS,
         next_threshold_check = 0,
         last_threshold_send  = 0,
-        manual_until         = 0
+        manual_until         = 0,
+        energy_kwh           = 0.0,
+        energy_updated_at    = socket.gettime(),
+        energy_status        = "STATUS_ON",
+        power_w              = 30.0
     }
     table.insert(device_order, device_id)
     print(string.format("[Sensor Lua:Identidade] Nó provisionado com ID: %s | Setor: %s",
@@ -389,11 +394,8 @@ local function send_discovery_response(target_device_id)
     end
 end
 
-local function build_lamp_metrics()
-    return {
-        { name = "luminosity",        value = math.random(75, 100),          unit = "%" },
-        { name = "power_consumption", value = 25.0 + (math.random() * 10.0), unit = "W" }
-    }
+local function build_lamp_metrics(device)
+    return LampMetrics.sample(device, socket.gettime())
 end
 
 local function lamp_threshold_reason(metrics)
@@ -411,16 +413,19 @@ local function lamp_threshold_reason(metrics)
 end
 
 local function send_metrics_payload(device, trigger_reason, metrics_override)
+    local sample_time = socket.gettime()
+    LampMetrics.update_energy(device, sample_time)
     if not trigger_reason and socket.gettime() >= device.manual_until then
         device.status = random_device_status()
     end
+    LampMetrics.update_energy(device, sample_time)
 
     local current_time = os.time()
     local msg_id = string.format("%s-%d-%04d",
                                  device.device_id, current_time, math.random(1, 9999))
     local metrics = {}
     if device.status == "STATUS_ON" then
-        metrics = metrics_override or build_lamp_metrics()
+        metrics = metrics_override or build_lamp_metrics(device)
     end
 
     local payload = {
@@ -459,7 +464,7 @@ local function poll_threshold_events(current_time)
            and (current_time - device.last_threshold_send) >= THRESHOLD_EVENT_COOLDOWN_SECS then
 
             device.next_threshold_check = current_time + THRESHOLD_SCAN_INTERVAL_SECS
-            local metrics        = build_lamp_metrics()
+            local metrics        = build_lamp_metrics(device)
             local trigger_reason = lamp_threshold_reason(metrics)
             if trigger_reason then
                 device.last_threshold_send = current_time
@@ -621,7 +626,10 @@ local function handle_control_command(client)
     end
 
     if cmd.update_status then
+        local change_time = socket.gettime()
+        LampMetrics.update_energy(target, change_time)
         target.status       = target_status
+        LampMetrics.update_energy(target, change_time)
         target.manual_until = socket.gettime() + MANUAL_OVERRIDE_SECS
         print("[Sensor Lua:Atuação] -> Status: " .. target.status)
     end

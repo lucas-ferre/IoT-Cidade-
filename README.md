@@ -3,87 +3,110 @@
 [![CI](https://github.com/lucas-ferre/projeto_socket/actions/workflows/ci.yml/badge.svg)](https://github.com/lucas-ferre/projeto_socket/actions/workflows/ci.yml)
 
 Laboratório distribuído de **telemetria, descoberta, controle remoto e análise de
-dados urbanos**. Cinco implementações de sensores — C, Lua, Java, Python e Go —
-compartilham um contrato Protocol Buffers e se comunicam com um gateway assíncrono
-central. Os dados são persistidos no SQLite e explorados em um dashboard Streamlit.
+dados urbanos**. Sensores em **C, Lua, Java, Python, Go, Rust e TypeScript**
+compartilham um contrato Protocol Buffers. Dois hubs filtram a comunicação com o
+gateway assíncrono, que persiste os dados no SQLite e atende ao dashboard Streamlit.
 
-> **Status:** projeto acadêmico e de portfólio para execução local. A arquitetura
-> demonstra integração e resiliência, mas ainda não oferece autenticação nem
-> criptografia suficientes para uso em uma rede não confiável.
-
-![Dashboard do laboratório Smart City](docs/assets/dashboard.png)
-
-## Por que este projeto é relevante
-
-- integra uma frota poliglota por meio de um único contrato Protobuf;
-- separa telemetria e descoberta por UDP do controle e das consultas por TCP;
-- aplica concorrência com `asyncio`, goroutines, threads POSIX/JVM/Python e loop Lua;
-- implementa framing binário, idempotência, backpressure, retry com jitter e heartbeat;
-- mantém séries históricas no SQLite com WAL, ledger transacional, retenção e rollups;
-- limita janelas e pontos de consultas OLAP antes de enviar dados ao dashboard;
-- oferece operação individual de dispositivos e feedback explícito dos comandos;
-- automatiza validação, testes, builds e smoke test no GitHub Actions.
+A configuração padrão possui **66 dispositivos**, **62 nomes distintos de
+métricas** e até **624 valores por rodada completa** de leituras. Dispositivos
+desligados continuam anunciando presença, mas não produzem leituras nessa condição.
 
 ## Arquitetura
 
-```mermaid
-flowchart LR
-    subgraph Sensores
-        C[Clima · C]
-        L[Postes · Lua]
-        J[Semáforos · Java]
-        P[Câmeras · Python]
-        GO[Estacionamentos · Go]
-    end
+O desenho abaixo usa texto simples e largura reduzida para leitura no GitHub.
+As setas representam o caminho lógico entre os componentes; as respostas e os
+comandos percorrem essas mesmas conexões.
 
-    C & L & J & P & GO -->|telemetria e descoberta · UDP| G[Gateway · asyncio]
-    G -->|controle · TCP| L & J & P & GO
-    G <--> DB[(SQLite · WAL e rollups)]
-    D[Dashboard · Streamlit] <-->|consultas e comandos · TCP| G
+```text
+Sensores (7 linguagens)
+         |
+         v
+    hub_sensores
+         |
+         v
+Gateway <---- hub_acesso <---- Dashboard
+   |
+   v
+SQLite
 ```
 
-O gateway é a única fronteira de persistência e coordenação. O endereço anunciado
-por um sensor é tratado como dado não confiável; para controle, o gateway utiliza o
-IP de origem observado no datagrama de descoberta.
+| Fluxo | Caminho | Transporte |
+|---|---|---|
+| Descoberta e heartbeat | sensor → hub_sensores → gateway | UDP 5002 |
+| Telemetria | sensor → hub_sensores → gateway → SQLite | UDP 5000 |
+| Inventário e análises | dashboard → hub_acesso → gateway | TCP 5001 |
+| Controle e confirmação | dashboard → hub_acesso → gateway → hub_sensores → sensor | TCP 5001, proxy 5010 e porta nativa |
 
-O ledger `(device_id, message_id)` e o checkpoint de ordem por dispositivo são
-confirmados junto com métricas e rollups, evitando duplicação após retransmissões
-ou reinicializações. O worker repete lotes quando a escrita falha. Os IDs expiram
-somente se `MESSAGE_MAX_AGE_SECS > 0`; com zero, permanecem no ledger.
+**`hub_sensores`** verifica o IP de origem contra os serviços autorizados, o
+prefixo do dispositivo, seu tipo, a porta de controle e o conteúdo dos datagramas.
+Ele mantém as rotas de controle e anuncia ao gateway a porta do proxy `5010`.
+O endereço declarado pelo sensor não é usado como destino confiável de controle.
 
-| Serviço | Runtime | Dispositivos padrão | Domínio | Controle |
-|---|---|---:|---|---:|
-| `sensor_clima` | C | 6 | clima e qualidade ambiental | — |
-| `sensor_posto` | Lua | 3 | luminosidade e consumo | `5006/TCP` |
-| `sensor_java` | Java 21 | 3 | fluxo e fila veicular | `5003/TCP` |
-| `sensor_camera` | Python 3.11 | 3 | tráfego e infrações | `5004/TCP` |
-| `sensor_estacionamento` | Go 1.23 | 3 | ocupação e rotatividade de vagas | `5007/TCP` |
+**`hub_acesso`** admite as origens configuradas em `ACCESS_ALLOWED_HOSTS`
+(`dashboard` por padrão), valida os pedidos Protobuf e encaminha consultas e
+comandos. Ambos aplicam limites de tamanho, tempo, taxa e concorrência e produzem
+auditoria JSON com o motivo das rejeições.
 
-As portas de controle permanecem apenas na rede interna do Compose. No host, o
-dashboard e as interfaces do gateway são publicados em `127.0.0.1` por padrão.
+| Rede do Compose | Participantes |
+|---|---|
+| `smart_city_net` | sensores, dashboard, hubs e simulador invasor opcional |
+| `gateway_backend` — interna | gateway e os dois hubs |
 
-## Novo sensor: estacionamento inteligente em Go
+O gateway não publica portas no host. O dashboard (`8501`), as entradas UDP do
+hub de sensores (`5000` e `5002`) e o hub de acesso (`5001`) são publicados em
+`127.0.0.1` por padrão. A porta do hub de acesso continua sujeita à autorização
+de origem; publicar a porta não autoriza um cliente externo automaticamente.
 
-O nó Go simula os estacionamentos **Centro**, **Campus** e **Hospital**. Cada
-dispositivo pode ser ligado, desligado ou ter sua frequência alterada de 1 a 60
-segundos, sem afetar os demais dispositivos do mesmo processo.
+## Frota e métricas
 
-Métricas publicadas:
+| Serviço | Linguagem | Dispositivos | Métricas por leitura | Domínio |
+|---|---|---:|---:|---|
+| `sensor_clima` | C | 12 | 13 | clima, partículas, qualidade do ar e ruído |
+| `sensor_posto` | Lua | 9 | 8 | iluminação, consumo e condições elétricas |
+| `sensor_java` | Java | 9 | 8 | semáforos, filas e fluxo de pedestres |
+| `sensor_camera` | Python | 9 | 8 | tráfego, infrações e confiança da detecção |
+| `sensor_estacionamento` | Go | 9 | 11 | vagas, rotatividade, receita e recarga elétrica |
+| `sensor_agua` | Rust | 9 | 8 | reservatórios, vazão, pressão e qualidade da água |
+| `sensor_lixeiras` | TypeScript | 9 | 9 | resíduos, bateria, sinal e condições da lixeira |
+| **Total** | **7 linguagens** | **66** | **624 valores por rodada** | |
 
-- `total_spaces`, `occupied_spaces` e `available_spaces`;
-- `occupancy_rate` em percentual;
-- `vehicle_turnover` em veículos por minuto.
+O [catálogo de métricas](docs/metrics.md) descreve cada nome e unidade.
+As simulações preservam relações entre grandezas: vagas ocupadas mais disponíveis
+igualam o total, veículos em recarga cabem nas vagas ocupadas, e tensão, corrente e
+potência dos postes são calculadas em conjunto.
 
-A simulação preserva a invariante
-`occupied_spaces + available_spaces = total_spaces`. O servidor de controle possui
-limite de clientes, deadline por conexão, validação temporal, rejeição de replay e
-encerramento gracioso. Veja a [implementação](projeto-sockets/sensor_go/main.go) e os
-[testes](projeto-sockets/sensor_go/main_test.go).
+O novo [sensor Rust](projeto-sockets/sensor_rust/README.md) usa bindings gerados do
+contrato central, descoberta e heartbeat UDP, controle individual TCP, proteção
+contra replay e encerramento gracioso. Os dispositivos `water_*` podem ser
+ligados, desligados e ter seu intervalo ajustado entre 1 e 60 segundos.
+
+O novo [sensor TypeScript](projeto-sockets/sensor_typescript/README.md) executa em
+Node.js sem dependências npm. Publica os dispositivos `waste_*`, usa um codec
+Protobuf validado contra os bindings Python e drena os envios durante o
+encerramento. Clima e lixeiras publicam continuamente e não expõem controle TCP.
+
+## Persistência e consultas
+
+O gateway combina `asyncio`, fila limitada, lotes de escrita e SQLite em WAL. O
+ledger `(device_id, message_id)` e o checkpoint de ordem por dispositivo são
+confirmados na mesma transação das métricas e dos rollups. Retransmissões e
+reinicializações não duplicam leituras já confirmadas; lotes com falha de escrita
+são repetidos. Os IDs expiram somente quando `MESSAGE_MAX_AGE_SECS > 0`.
+
+As consultas calculam média, desvio-padrão amostral e variação máxima. A fonte
+analítica considera duração e retenção do período; os metadados identificam a
+resolução e a janela efetiva. Os limites padrão são 30 dias e 2.000 pontos por
+consulta. Gráficos usam datas completas em UTC para preservar leituras de dias
+diferentes.
+
+Requisições e confirmações possuem identificadores correlacionados. O gateway
+confere o ID do comando e os valores de estado e frequência devolvidos pelo
+sensor antes de reportar sucesso.
 
 ## Início rápido
 
 Pré-requisitos: Docker Engine com Compose v2 ou uma configuração compatível do
-Podman. Não é necessário instalar os cinco runtimes no host.
+Podman. Os runtimes dos sensores são preparados pelas imagens.
 
 ```bash
 git clone https://github.com/lucas-ferre/projeto_socket.git
@@ -92,22 +115,28 @@ docker compose config --quiet
 docker compose up --build --detach --wait
 ```
 
-Abra <http://127.0.0.1:8501>. Para acompanhar ou encerrar o laboratório:
+Abra [o dashboard local](http://127.0.0.1:8501). Para verificar o caminho completo
+das sete famílias até o banco, incluindo um comando ao sensor Rust:
+
+```bash
+docker compose exec -T dashboard python smoke.py --expected-devices 66
+```
+
+Esse teste aguarda descoberta e leituras, consulta séries pelo hub de acesso e
+reaplica o intervalo padrão de 5 segundos a um dispositivo Rust. Em uma frota
+personalizada, ajuste `--expected-devices` para o total configurado.
 
 ```bash
 docker compose ps
-docker compose logs --follow gateway dashboard sensor_estacionamento
+docker compose logs --follow gateway hub_sensores hub_acesso
 docker compose down
 ```
 
-O volume `gateway_db` preserva o histórico. Para remover também os dados simulados,
-use conscientemente `docker compose down --volumes`.
-
-Em `SIGTERM`/`SIGINT`, o gateway para de admitir entradas e tenta drenar a fila
-antes de fechar o banco. O prazo padrão é 20 segundos
-(`TELEMETRY_SHUTDOWN_TIMEOUT_SECS`), com 45 segundos de tolerância no Compose.
-Prazo excedido ou falha final de escrita geram erro no log e podem perder pacotes
-que ainda estavam em memória.
+O volume `gateway_db` preserva o histórico. `docker compose down --volumes` também
+remove os dados simulados. Em `SIGTERM`/`SIGINT`, o gateway interrompe novas entradas
+e tenta drenar a fila antes de fechar o banco: prazo padrão de 20 segundos, com
+45 segundos de tolerância no Compose. Prazo excedido ou falha final de escrita
+geram erro no log; pacotes ainda em memória podem não ser persistidos.
 
 ### Configuração
 
@@ -115,76 +144,88 @@ que ainda estavam em memória.
 cp .env.example .env
 ```
 
-No PowerShell:
+No PowerShell, use `Copy-Item .env.example .env`. O arquivo permite ajustar as
+quantidades de sensores, os limites dos hubs, a ingestão e a retenção. A referência
+está em [Operações](docs/operations.md).
 
-```powershell
-Copy-Item .env.example .env
+## Sensor invasor para testes
+
+O serviço `sensor_invasor` pertence ao perfil opcional `security-test` e só executa
+quando solicitado. Uma rodada contém **12 cenários limitados: 9 envios UDP e
+3 pedidos TCP**, incluindo identidade desconhecida, tentativa de imitar um
+dispositivo existente, mensagem malformada, timestamp inválido e métrica não finita.
+
+Com o laboratório em execução:
+
+```bash
+docker compose --profile security-test run --build --rm sensor_invasor
+docker compose logs --since 2m hub_sensores hub_acesso
+docker compose exec -T dashboard python smoke.py --expected-devices 66
 ```
 
-As quantidades de dispositivos, os limites de entrada e a janela analítica podem
-ser alterados no `.env`. Mantenha `BIND_ADDRESS=127.0.0.1` durante o desenvolvimento.
-A referência completa está em [Operações](docs/operations.md).
+O simulador aceita somente destinos privados ou loopback e não envia comandos
+válidos de atuação. Sua saída distingue rejeições TCP de datagramas UDP enviados
+sem confirmação. A prova de bloqueio UDP vem da auditoria dos hubs e dos testes de
+integração, que verificam que inventário, rotas e tabelas do SQLite permanecem
+intactos após os 12 cenários. Veja o [simulador](projeto-sockets/sensor_intruder/README.md).
 
 ## Dashboard
 
-O cliente oferece quatro fluxos:
+1. **Fontes de dados:** inventário e presença dos dispositivos.
+2. **Painel de atuação:** estado e frequência por dispositivo controlável.
+3. **Consultas analíticas:** seleção das 62 métricas e operações por intervalo.
+4. **Inspeção individual:** métricas de cada família, série temporal e eventos.
 
-1. **Fontes de dados:** inventário e presença da frota descoberta;
-2. **Painel de atuação:** status e frequência por dispositivo controlável;
-3. **Consultas analíticas:** média, desvio-padrão e variação máxima por intervalo;
-4. **Inspeção individual:** série temporal e eventos de um dispositivo.
-
-Toda requisição recebe identificador e timestamp. Comandos inválidos são recusados
-antes da mutação, e consultas excessivas são limitadas a 30 dias e 2.000 pontos por
-padrão.
-
-O gateway devolve o `message_id` da requisição para correlação no cliente e confere
-o ID, estado e frequência das confirmações de atuação. A fonte OLAP considera
-duração e retenção do período consultado; buckets das bordas podem ampliar a
-janela, explicitada nos metadados do resultado.
+O [catálogo compartilhado](projeto-sockets/client/metric_catalog.py) mantém
+rótulos, unidades e opções de consulta consistentes, inclusive para água e lixeiras.
 
 ## Validação
 
-As regressões de gateway, dashboard e sensor Python usam banco temporário e
-sockets locais. Prepare um ambiente Python com `protoc` disponível; os comandos
-abaixo partem da raiz do repositório:
+Os testes de integração exercitam UDP e TCP reais em loopback, os dois hubs, o
+gateway e um banco SQLite temporário. Incluem descoberta, consulta persistente,
+telemetria, controle com ACK e os cenários do invasor.
 
 ```bash
 cd projeto-sockets
-python -m pip install -r gateway/requirements.txt -r client/requirements.txt -r sensor_python/requirements.txt
+python -m pip install -r gateway/requirements.txt -r client/requirements.txt -r sensor_python/requirements.txt -r hubs/requirements.txt -r sensor_intruder/requirements.txt
 protoc -I=common --python_out=gateway common/messages.proto
 protoc -I=common --python_out=client common/messages.proto
 protoc -I=common --python_out=sensor_python common/messages.proto
 python -m unittest discover -s tests -v
 python -m unittest discover -s sensor_python -p 'test_*.py' -v
+node --experimental-strip-types --test sensor_typescript/tests/*.test.ts
+python -m unittest discover -s sensor_typescript/tests -p 'test_*.py' -v
 ```
 
-O teste C do AQI e detalhes da preparação estão em [Operações](docs/operations.md#validação-e-testes)
-e [Setup](SETUP.md#5-validações-antes-de-uma-contribuição).
-
-O sensor Go é validado com:
+Para Rust:
 
 ```bash
-cd projeto-sockets/sensor_go
-go mod verify
-go vet ./...
-go test ./...
+cd sensor_rust
+cargo fmt --check
+cargo test --locked
+cargo build --locked
 ```
 
-O build da imagem também executa `go test -race -mod=readonly ./...`. O workflow de
-CI valida o Compose, compila os módulos Python, executa os testes, constrói os sete
-serviços e realiza um smoke test no endpoint de saúde do dashboard. A preparação
-gera os bindings Python nos três diretórios e instala seus manifestos; o teste C
-do AQI também é executado no CI.
+Os comandos C, Lua, Java e Go estão em [Operações](docs/operations.md#validação-e-testes)
+e [Setup](SETUP.md). Os testes das simulações verificam faixas, unidades e relações
+entre métricas. O codec TypeScript é decodificado pelo Protobuf Python nos testes
+de compatibilidade.
+
+O [workflow de CI](.github/workflows/ci.yml) prepara as linguagens, executa as
+regressões, constrói os 11 serviços padrão e inicia o Compose. Depois verifica a
+saúde do dashboard, consulta dados das sete famílias, testa controle Rust através
+dos hubs e executa o simulador invasor. A imagem Go também executa testes com
+detector de condições de corrida.
 
 ## Documentação
 
 | Documento | Conteúdo |
 |---|---|
 | [Índice técnico](docs/README.md) | mapa do código e fontes de verdade |
-| [Arquitetura](docs/architecture.md) | componentes, fluxos, concorrência e persistência |
-| [Protocolo](docs/protocol.md) | mensagens, framing, portas, validações e evolução |
-| [Operações](docs/operations.md) | configuração, observabilidade, testes e diagnóstico |
+| [Arquitetura](docs/architecture.md) | redes, hubs, fluxos e persistência |
+| [Protocolo](docs/protocol.md) | mensagens, framing, portas e validações |
+| [Métricas](docs/metrics.md) | catálogo das sete famílias e unidades |
+| [Operações](docs/operations.md) | configuração, auditoria, testes e diagnóstico |
 | [Setup](SETUP.md) | preparação detalhada do ambiente |
 | [Segurança](SECURITY.md) | modelo de ameaça e limites conhecidos |
 | [Contribuição](CONTRIBUTING.md) | critérios para mudanças verificáveis |
@@ -201,31 +242,33 @@ do AQI também é executado no CI.
 └── projeto-sockets/
     ├── common/messages.proto
     ├── gateway/
+    ├── hubs/
     ├── client/
     ├── sensor_c/
     ├── sensor_lua/
     ├── sensor_java/
     ├── sensor_python/
     ├── sensor_go/
+    ├── sensor_rust/
+    ├── sensor_typescript/
+    ├── sensor_intruder/
     ├── tests/
     └── docker-compose.yml
 ```
 
 ## Escopo de segurança
 
-O projeto possui limites de frame e datagrama, validação de enums, campos, métricas
-e timestamps, deduplicação, proteção contra replay local e publicação de portas no
-loopback. Ainda assim, UDP e TCP não são autenticados nem criptografados. Não exponha
-o laboratório diretamente à Internet. Para evolução além do ambiente acadêmico,
-consulte [SECURITY.md](SECURITY.md).
+Este é um laboratório acadêmico para execução local. Os hubs restringem origens
+por DNS/IP e perfil de dispositivo, validam mensagens e limitam recursos. Essas
+verificações não fornecem identidade criptográfica: UDP/TCP não possuem TLS,
+mTLS nem assinatura das mensagens. O isolamento do gateway no Compose e os testes
+do invasor cobrem o cenário descrito em [SECURITY.md](SECURITY.md).
 
 ## Decisões mantidas em aberto
 
-Conforme o planejamento do projeto, duas decisões serão tomadas após esta rodada:
-
-- **ponto 1 — estratégia definitiva de build:** manter Dockerfiles por serviço,
-  consolidar o fallback ou adotar outra organização;
-- **ponto 9 — licença:** escolher a licença compatível com o objetivo do portfólio.
+- **Ponto 1 — estratégia definitiva de build:** manter Dockerfiles por serviço,
+  consolidar o fallback ou adotar outra organização.
+- **Ponto 9 — licença:** escolher a licença compatível com o objetivo do portfólio.
 
 Até a escolha do ponto 9, a ausência de um arquivo `LICENSE` significa que não há
 uma permissão aberta de reutilização concedida pelo repositório.

@@ -1,53 +1,44 @@
 # Configuração do ambiente de desenvolvimento
 
-Este documento descreve a preparação, execução e validação local do sistema
-distribuído. O caminho recomendado utiliza contêineres: não é necessário instalar
-Python, C, Java, Lua, Go ou Protobuf diretamente no host para executar a aplicação.
+O laboratório possui sensores em C, Lua, Java, Python, Go, Rust e TypeScript.
+As imagens instalam suas toolchains; para executar a aplicação com Compose,
+não é necessário instalar essas linguagens diretamente no host.
 
-## 1. Pré-requisitos
+## 1. Pré-requisitos e primeira execução
 
-Use um dos runtimes abaixo:
+| Opção | Referência | Verificação |
+|---|---|---|
+| Docker Engine + Compose v2 | Docker 24+ e Compose 2.20+ | `docker compose version` |
+| Podman + provider Compose | Suporte a builds, redes internas e healthchecks | `podman compose version` |
 
-| Opção | Versão de referência | Verificação |
-|---|---:|---|
-| Docker Engine + Compose v2 | Docker `>= 24`, Compose `>= 2.20` | `docker compose version` |
-| Podman + provider Compose | instalação atual com suporte a Compose | `podman compose version` |
-
-No Windows, confirme que Docker Desktop ou a máquina do Podman está em execução
-antes de iniciar o ambiente.
-
-## 2. Primeira execução
-
-Os comandos abaixo partem da raiz do repositório:
+No Windows, inicie Docker Desktop ou a máquina do Podman. A partir da raiz do
+repositório:
 
 ```bash
 cd projeto-sockets
 docker compose config --quiet
-docker compose up --build -d --wait
+docker compose up --build -d --wait --wait-timeout 180
 docker compose ps
 ```
 
-Quando todos os healthchecks estiverem saudáveis, abra
-<http://127.0.0.1:8501>. Para acompanhar ou encerrar o ambiente:
+Abra [o dashboard local](http://127.0.0.1:8501). A configuração padrão anuncia
+66 dispositivos: 12 estações C e nove dispositivos por família nas outras seis
+linguagens. O [catálogo](docs/metrics.md) descreve as métricas e unidades.
 
 ```bash
-docker compose logs -f
+docker compose logs -f gateway hub_sensores hub_acesso dashboard
 docker compose down
 ```
 
-O volume `gateway_db` preserva o SQLite entre reinicializações. Para apagar também
-os dados da simulação, use conscientemente `docker compose down --volumes`.
+O volume `gateway_db` preserva o histórico SQLite. `docker compose down --volumes`
+remove esse histórico. No encerramento, o gateway interrompe entradas e tenta
+drenar os dados admitidos por até `TELEMETRY_SHUTDOWN_TIMEOUT_SECS=20`; o Compose
+concede 45 segundos ao serviço. Logs de falha ou prazo excedido indicam que
+pacotes ainda em memória podem não ter sido persistidos.
 
-Ao receber `SIGTERM` ou `SIGINT`, o gateway fecha as entradas e drena a telemetria
-admitida antes de encerrar o banco. A espera usa
-`TELEMETRY_SHUTDOWN_TIMEOUT_SECS=20`, e o Compose concede 45 segundos ao serviço.
-Se o prazo terminar ou a escrita não recuperar, consulte os erros de drenagem nos
-logs: pacotes ainda em memória podem não ter sido gravados.
+## 2. Topologia e configuração local
 
-## 3. Configuração local
-
-O Compose possui valores seguros por padrão. Para personalizar a simulação, copie o
-arquivo de exemplo sem versionar a cópia:
+Copie `.env.example` para `.env` dentro de `projeto-sockets`:
 
 ```bash
 cp .env.example .env
@@ -59,134 +50,175 @@ No PowerShell:
 Copy-Item .env.example .env
 ```
 
-As opções iniciais controlam o nível de log, o número de dispositivos virtuais e o
-endereço de publicação. Mantenha `BIND_ADDRESS=127.0.0.1`; consulte
-[SECURITY.md](SECURITY.md) antes de expor portas em outra interface.
+O Compose repassa as opções declaradas no `environment` de cada serviço. Uma
+variável adicional em `.env` não é injetada automaticamente; inclua-a no Compose
+quando o processo precisar recebê-la.
 
-## 4. Matriz de linguagens e dependências
+| Rede | Participantes |
+|---|---|
+| `smart_city_net` | Sensores, dashboard e dois hubs; invasor somente no perfil de teste |
+| `gateway_backend` | Gateway e dois hubs; `internal: true` |
 
-### Python 3.11
+O gateway não publica portas e não participa da frontend. `hub_sensores` publica
+UDP/5000 e UDP/5002, `hub_acesso` publica TCP/5001, e o dashboard publica HTTP/8501.
+O bind padrão é `127.0.0.1`; consulte [SECURITY.md](SECURITY.md) ao alterar a
+exposição. As portas de controle 5003, 5004, 5006, 5007, 5008 e 5010 ficam internas.
 
-| Serviço | Manifesto | Dependências diretas |
-|---|---|---|
-| Gateway | `projeto-sockets/gateway/requirements.txt` | `aiosqlite`, `protobuf` |
-| Dashboard | `projeto-sockets/client/requirements.txt` | `streamlit`, `pandas`, `protobuf` |
-| Sensor de câmera | `projeto-sockets/sensor_python/requirements.txt` | `protobuf` |
+Nos sensores, `GATEWAY_HOST=hub_sensores`; no dashboard,
+`GATEWAY_HOST=hub_acesso`; nos hubs, `GATEWAY_HOST=gateway`. Preserve essa rota.
+O hub de acesso aceita apenas a origem DNS/IPv4 `dashboard` por padrão.
+Clientes TCP adicionais precisam estar em `ACCESS_ALLOWED_HOSTS`; a publicação
+de 5001 no host não concede autorização automática.
 
-Os Dockerfiles instalam esses manifestos e executam `python -m pip check`. Para
-desenvolvimento fora de contêiner, use ambientes virtuais. A suíte conjunta precisa
-dos três manifestos no mesmo ambiente e dos bindings em `gateway`, `client` e
-`sensor_python`, conforme a preparação abaixo.
+Os perfis do hub de sensores relacionam prefixo, tipo, porta nativa e serviço
+DNS autorizado. O IP observado precisa corresponder ao serviço. A topologia
+usa IPv4 e identidade de rede, sem assinatura ou credencial criptográfica.
+Heartbeats recuperam reinicializações; o multicast do gateway fica na backend
+e não atravessa automaticamente para sensores na frontend.
 
-### C / POSIX
+## 3. Matriz de ferramentas
 
-O sensor climático utiliza compilador compatível com C11, pthreads,
-`protobuf-c-compiler` e `libprotobuf-c-dev`. A imagem usa Ubuntu 24.04 e instala a
-toolchain durante o build.
+| Linguagem/componente | Dependências de desenvolvimento |
+|---|---|
+| Python 3.11: gateway | `gateway/requirements.txt`: `aiosqlite`, `protobuf` |
+| Python 3.11: dashboard | `client/requirements.txt`: `streamlit`, `pandas`, `protobuf` |
+| Python 3.11: câmera, hubs, invasor | Manifestos das três pastas; `protobuf` |
+| C11/POSIX | Compilador, pthreads, `protobuf-c-compiler`, `libprotobuf-c-dev`, libm |
+| Java 21 | JDK para build; JRE e `protobuf-java-3.25.1.jar` para execução |
+| Lua 5.4 | LuaRocks, `lua-protobuf`, `luasocket`, `luaposix` |
+| Go 1.23 | `sensor_go/go.mod`, `go.sum`, `protoc` e `protoc-gen-go` |
+| Rust 1.90+ | Cargo, `sensor_rust/Cargo.lock`, `prost`, compilador Protobuf empacotado |
+| TypeScript / Node 22.18+ | Remoção de tipos nativa; sem dependências npm |
 
-### Java 21
+Rust gera bindings de `common/messages.proto` no `build.rs`; preserve o lock e
+use `--locked`. A imagem final Rust usa usuário sem privilégios. Go verifica
+checksums, executa testes com detector de races e produz binário estático para
+imagem distroless sem root. Os manifestos Python são instalados com `pip check`.
 
-O sensor de semáforo é compilado com Eclipse Temurin JDK 21 e executado em JRE 21.
-O runtime `protobuf-java-3.25.1.jar` é obtido durante o estágio de build.
+TypeScript envia descoberta e telemetria com um codec de saída próprio. Os
+testes Node validam modelo/runtime; uma suíte Python decodifica fixtures com
+bindings gerados de Protobuf, incluindo int64, fixed64 e UTF-8.
 
-### Lua 5.4
+## 4. Testes locais por linguagem
 
-O sensor de poste utiliza Lua 5.4, LuaRocks, `lua-protobuf`, `luasocket` e
-`luaposix`. O último pacote é necessário para tratar sinais e realizar o encerramento
-gracioso.
-
-### Go 1.23
-
-O sensor de estacionamento usa o módulo em
-`projeto-sockets/sensor_go/go.mod`. O build gera o pacote Go a partir do contrato
-`common/messages.proto`, verifica os checksums com `go mod verify`, executa os
-testes com o detector de data races e produz um binário estático para uma imagem
-distroless não root.
-
-## 5. Validações antes de uma contribuição
-
-Execute pelo menos:
-
-```bash
-cd projeto-sockets
-docker compose config --quiet
-docker compose build
-docker compose up -d --wait --wait-timeout 180
-curl --fail http://127.0.0.1:8501/_stcore/health
-docker compose down
-```
-
-Em uma máquina com Python e `protoc` disponíveis, ative um ambiente virtual e
-execute na raiz `projeto-sockets`:
+Na raiz `projeto-sockets`, use um ambiente virtual Python e `protoc`:
 
 ```bash
-python -m pip install -r gateway/requirements.txt -r client/requirements.txt -r sensor_python/requirements.txt
+python -m pip install -r gateway/requirements.txt -r client/requirements.txt -r sensor_python/requirements.txt -r hubs/requirements.txt -r sensor_intruder/requirements.txt
 protoc -I=common --python_out=gateway common/messages.proto
 protoc -I=common --python_out=client common/messages.proto
 protoc -I=common --python_out=sensor_python common/messages.proto
-python -m compileall -q gateway/main.py gateway/analytics.py client/app.py sensor_python/sensor.py
+python -m compileall -q gateway client sensor_python hubs sensor_intruder
 python -m unittest discover -s tests -v
 python -m unittest discover -s sensor_python -p 'test_*.py' -v
 ```
 
-Os testes usam SQLite temporário e sockets locais, sem exigir o Compose em
-execução. Incluem ledger e replay após reinício, rollback, retry e encerramento,
-retenção OLAP, correlação de pedidos/respostas, atuação e gráficos do dashboard.
-A validação de sintaxe com `compileall` pode ser executada separadamente sem
-importar os módulos.
+Os testes usam SQLite temporário e sockets locais, sem exigir Compose. Cobrem
+ledger/replay, transações e drenagem, retenção OLAP, correlação e atuação, além
+de autorização, descarte, relay e encerramento dos hubs e cenários do invasor.
+`compileall` valida sintaxe sem importar os módulos.
 
-Com GCC disponível, valide o AQI na mesma raiz:
+Com GCC disponível, na mesma raiz:
 
 ```bash
 gcc -std=c11 -Wall -Wextra -Werror sensor_c/test_aqi.c -lm -o test-aqi
 ./test-aqi
+gcc -std=c11 -Wall -Wextra -Werror sensor_c/test_environment.c -lm -o test-environment
+./test-environment
 ```
 
-No Windows, use `-o test-aqi.exe` e execute `.\test-aqi.exe`. Essa verificação
-cobre o cálculo em C; o build completo também exige a toolchain POSIX/Protobuf-C.
+No Windows, use nomes terminados em `.exe` e execute com `./` ou `.\`. A
+compilação completa do sensor exige também POSIX e Protobuf-C.
 
-Em uma máquina com Go e `protoc-gen-go` disponíveis:
+Na pasta `sensor_go`, após gerar o binding com `protoc-gen-go` disponível:
 
 ```bash
-cd sensor_go
+mkdir -p proto
+protoc --proto_path=../common --go_out=./proto --go_opt=paths=source_relative ../common/messages.proto
 go mod verify
 go vet ./...
 go test ./...
 ```
 
-O workflow `.github/workflows/ci.yml` instala os três manifestos Python, gera os
-bindings, executa as duas suítes Python e o teste C, e então faz build e smoke test
-em pushes da branch principal e pull requests. Para verificar a integração local,
-execute também os comandos Compose desta seção.
+Na pasta `sensor_rust`, com Rust 1.90 ou superior:
+
+```bash
+cargo test --locked
+cargo build --release --locked
+```
+
+Na raiz `projeto-sockets`, com Node 22.18+, Python e `protoc` ou `grpcio-tools`:
+
+```bash
+node --experimental-strip-types --test sensor_typescript/tests/model.test.ts sensor_typescript/tests/runtime.test.ts
+python -m unittest discover -s sensor_typescript/tests -p 'test_*.py' -v
+javac sensor_java/TrafficSample.java sensor_java/TrafficSampleTest.java
+java -cp sensor_java TrafficSampleTest
+```
+
+São oito testes Node e duas verificações Python do codec. O teste Java de
+amostras não exige Protobuf; seu Dockerfile compila o sensor completo depois.
+Na pasta `sensor_lua`, execute `lua5.4 test_lamp_metrics.lua`. As verificações
+C, Lua, Java, Go, Rust e TypeScript também fazem parte de seus builds.
+
+## 5. Validação integrada e invasor
+
+Na raiz `projeto-sockets`:
+
+```bash
+docker compose config --quiet
+docker compose build
+docker compose up -d --wait --wait-timeout 180
+curl --fail http://127.0.0.1:8501/_stcore/health
+docker compose exec dashboard python smoke.py --expected-devices 66
+docker compose --profile security-test run --build --rm sensor_invasor
+docker compose logs --since=2m hub_sensores hub_acesso
+docker compose down
+```
+
+O smoke test executa dentro do dashboard autorizado e usa os hubs para consultar
+a frota e testar atuação. Ajuste a expectativa de dispositivos se mudou as
+contagens.
+
+O invasor fica desligado fora do perfil `security-test`; seu processo também
+exige `INTRUDER_ENABLED=1`. Emite 12 cenários finitos, nove UDP e três TCP,
+somente aos dois destinos privados/loopback configurados. Não há varredura nem
+comando válido capaz de modificar os sensores. O envio UDP é registrado como
+`sent_not_acknowledged`: confirme descarte nos logs/contadores dos hubs e nos
+testes de integração, não apenas na saída do emissor.
+
+O workflow [ci.yml](.github/workflows/ci.yml) reúne as suítes, builds, smoke test
+e emissão invasora. Uma verificação declarada no CI ainda precisa executar com
+sucesso; registre quais toolchains, testes e imagens foram realmente validados
+e quais permaneceram indisponíveis no ambiente local.
 
 ## 6. Podman no Windows
 
-Se `podman compose` não localizar um provider, instale/configure `podman-compose` e
-defina `PODMAN_COMPOSE_PROVIDER=podman-compose`. A partir da raiz do repositório,
-também é possível usar o helper:
+Se `podman compose` não encontrar provider, configure `podman-compose` e
+`PODMAN_COMPOSE_PROVIDER=podman-compose`. A partir da raiz do repositório:
 
 ```powershell
 .\projeto-sockets\scripts\podman-compose.ps1 up --build
 ```
 
-O `projeto-sockets/Dockerfile` contém estágios de fallback para providers que não
-respeitam `build.dockerfile`; ele deve permanecer sincronizado com os Dockerfiles de
-cada serviço, inclusive `sensor_go/Dockerfile`.
+O Dockerfile de fallback em `projeto-sockets/Dockerfile` deve acompanhar os
+Dockerfiles específicos, inclusive os novos hubs, invasor, Rust e TypeScript.
+Verifique se o provider aplica `internal: true`, os perfis e healthchecks.
 
-## 7. Problemas comuns
+## 7. Diagnóstico
 
-- **Compose não encontra o arquivo:** confirme que o terminal está em
-  `projeto-sockets` ou informe `-f projeto-sockets/docker-compose.yml` a partir da
-  raiz.
-- **Falha ao conectar ao daemon:** inicie Docker Desktop ou a máquina virtual do
-  Podman e repita `docker version`/`podman info`.
-- **Primeiro build demorado:** as toolchains C, Java, Lua, Go e Protobuf são baixadas na
-  primeira execução; builds seguintes aproveitam cache.
-- **Porta já ocupada:** altere o serviço conflitante conscientemente no Compose;
-  não exponha portas em `0.0.0.0` apenas para contornar o conflito.
-- **Descoberta multicast no Podman/Windows:** algumas combinações de rede virtual
-  limitam multicast. Verifique os logs do gateway e dos sensores e compare com um
-  ambiente Docker/Linux antes de atribuir o erro ao protocolo.
-- **Encerramento registra falha de drenagem:** confira disponibilidade e espaço
-  do banco, retries de escrita e `TELEMETRY_SHUTDOWN_TIMEOUT_SECS`. Ao aumentar o
-  prazo, ajuste também a tolerância de parada do Compose.
+- **Arquivo Compose não encontrado:** entre em `projeto-sockets` ou informe
+  `-f projeto-sockets/docker-compose.yml` a partir da raiz.
+- **Daemon indisponível:** inicie Docker Desktop ou a máquina do Podman e
+  verifique `docker version` ou `podman info`.
+- **Primeiro build demorado:** compiladores e dependências são baixados nessa
+  execução; builds posteriores aproveitam cache.
+- **Sensor não aparece:** verifique `hub_sensores`, DNS do serviço e eventos
+  `source_identity_mismatch`, `profile_mismatch` e `device_not_discovered`.
+  Aguarde o heartbeat; não dependa do probe backend para alcançar a frontend.
+- **Cliente TCP rejeitado:** confira `ACCESS_ALLOWED_HOSTS` e o IPv4 realmente
+  visto pelo hub na auditoria. A interface web usa o dashboard já autorizado.
+- **Falha de drenagem:** investigue SQLite, espaço, retries e o prazo de
+  encerramento. Aumentar esse prazo exige margem correspondente no Compose.
+
+Mais detalhes estão em [Operações](docs/operations.md).

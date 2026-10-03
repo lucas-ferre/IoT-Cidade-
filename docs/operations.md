@@ -5,7 +5,7 @@
 ## Pré-requisitos
 
 Para a execução padrão, use Docker Desktop com Compose v2 ou Podman com suporte
-a Compose. As toolchains de Python, C, Lua, Java, Go e Protobuf são instaladas
+a Compose. As toolchains de Python, C, Lua, Java, Go, Rust, Node e Protobuf são instaladas
 nas imagens; não é necessário instalá-las no host para iniciar o laboratório.
 
 Detalhes de preparação estão em [SETUP.md](../SETUP.md).
@@ -24,7 +24,7 @@ Abra `http://localhost:8501`. Para acompanhar o estado:
 
 ```bash
 docker compose ps
-docker compose logs -f gateway dashboard sensor_estacionamento
+docker compose logs -f gateway hub_sensores hub_acesso dashboard
 ```
 
 Encerre preservando o banco:
@@ -53,20 +53,28 @@ No Podman, substitua `docker compose` por `podman compose` ou use o helper
 
 | Serviço | Bind padrão | Transporte | Uso |
 |---|---|---|---|
-| `gateway` | `127.0.0.1:5000` | UDP | Telemetria |
-| `gateway` | `127.0.0.1:5001` | TCP | Cliente/dashboard |
-| `gateway` | `127.0.0.1:5002` | UDP | Descoberta |
+| `hub_sensores` | `127.0.0.1:5000` | UDP | Telemetria |
+| `hub_acesso` | `127.0.0.1:5001` | TCP | Cliente/dashboard autorizado |
+| `hub_sensores` | `127.0.0.1:5002` | UDP | Descoberta |
 | `dashboard` | `127.0.0.1:8501` | HTTP/TCP | Interface Streamlit |
 
 ### Somente na rede Compose
 
 | Serviço | Porta | Transporte | Uso |
 |---|---:|---|---|
-| `sensor_semaforo` | 5003 | TCP | Controle Java |
+| `gateway` | 5000 / 5001 / 5002 | UDP / TCP / UDP | Entradas somente na backend interna |
+| `hub_sensores` | 5010 | TCP | Controle recebido do gateway |
+| `sensor_java` | 5003 | TCP | Controle Java |
 | `sensor_camera` | 5004 | TCP | Controle Python |
-| Multicast dos sensores | 5005 | UDP | Recuperação de descoberta |
+| Multicast | 5005 | UDP | Probe restrito à rede de emissão |
 | `sensor_posto` | 5006 | TCP | Controle Lua |
 | `sensor_estacionamento` | 5007 | TCP | Controle Go |
+| `sensor_agua` | 5008 | TCP | Controle Rust |
+
+O gateway não publica portas. `gateway_backend` é uma bridge interna com
+somente gateway e hubs. `smart_city_net` reúne hubs, dashboard e sensores. Clima
+e lixeiras não têm controle TCP. Os comandos seguem gateway → hub/5010 → porta
+nativa do sensor.
 
 Não publique as portas internas. Para acesso a partir de outra máquina,
 `BIND_ADDRESS=0.0.0.0` altera somente as portas explicitamente publicadas no
@@ -89,11 +97,18 @@ O arquivo `.env` é local e não deve ser versionado.
 |---|---:|---|
 | `BIND_ADDRESS` | `127.0.0.1` | Interface usada nas portas publicadas |
 | `LOG_LEVEL` | `INFO` | Verbosidade do gateway |
-| `C_DEVICE_COUNT` | `6` | Estações ambientais no processo C |
-| `LUA_DEVICE_COUNT` | `3` | Postes no processo Lua |
-| `JAVA_DEVICE_COUNT` | `3` | Semáforos no processo Java |
-| `CAMERA_DEVICE_COUNT` | `3` | Câmeras no processo Python |
-| `GO_PARKING_DEVICE_COUNT` | `3` | Estacionamentos no processo Go, entre 1 e 100 |
+| `C_DEVICE_COUNT` | `12` | Estações ambientais no processo C |
+| `LUA_DEVICE_COUNT` | `9` | Postes no processo Lua |
+| `JAVA_DEVICE_COUNT` | `9` | Semáforos no processo Java |
+| `CAMERA_DEVICE_COUNT` | `9` | Câmeras no processo Python |
+| `GO_PARKING_DEVICE_COUNT` | `9` | Estacionamentos no processo Go, entre 1 e 100 |
+| `RUST_WATER_DEVICE_COUNT` | `9` | Pontos de água Rust, entre 1 e 100 |
+| `TS_WASTE_DEVICE_COUNT` | `9` | Lixeiras TypeScript, entre 1 e 100 |
+
+Esses padrões totalizam 66 dispositivos. As famílias publicam respectivamente
+13, 8, 8, 8, 11, 8 e 9 métricas por amostra ligada. Consulte o
+[catálogo](metrics.md), incluindo `parking_wait_time` em minutos, separado de
+`average_wait` dos semáforos em segundos.
 
 Não use `docker compose up --scale` para duplicar um processo sensor sem também
 definir uma estratégia de IDs: réplicas com a mesma configuração anunciariam as
@@ -113,9 +128,43 @@ contagem.
 | `DEVICE_OFFLINE_CHECK_INTERVAL_SECS` | `5` | Intervalo da varredura de presença |
 | `DISCOVERY_MAX_IN_FLIGHT` | `256` | Processamentos de descoberta concorrentes |
 
-O sensor Go também aceita `GATEWAY_HOST` (`gateway`), `SENSOR_HOSTNAME`
-(`sensor_estacionamento`) e `SENSOR_HEALTHCHECK_ADDRESS` para diagnósticos
-específicos. Em uma execução normal pelo Compose, os padrões já são adequados.
+O Compose define `GATEWAY_HOST=hub_sensores` nos sensores e
+`GATEWAY_HOST=hub_acesso` no dashboard. Os hubs usam `GATEWAY_HOST=gateway`.
+Os runtimes podem ter `gateway` como padrão quando executados isoladamente;
+preserve as substituições do Compose para manter a interceptação.
+
+O probe multicast do gateway fica na backend e não chega automaticamente à
+frontend. O próximo heartbeat de descoberta recupera sensores após reiniciar
+gateway ou hub. A topologia atual e os perfis de origem usam IPv4.
+
+### Hubs e autorização de origem
+
+| Variável | Padrão no Compose | Efeito |
+|---|---:|---|
+| `ACCESS_ALLOWED_HOSTS` | `dashboard` | CSV explícito de serviços/IPv4 autorizados |
+| `HUB_MAX_CLIENTS` | `64` no hub de acesso | Limite de conexões simultâneas |
+| `HUB_RATE_PER_SECOND` | `120` no hub de sensores | Reposição de tokens por origem/canal |
+| `HUB_RATE_BURST` | `240` no hub de sensores | Capacidade de rajada por origem/canal |
+| `HUB_DEVICE_TTL_SECS` | `120` | Tempo de validade após descoberta aceita |
+
+Somente o IPv4 do serviço autorizado para cada prefixo/tipo/porta pode registrar
+sensores. O hub não usa o endereço anunciado para escolher um endpoint. O
+controle recebido em 5010 exige origem correspondente ao gateway. Veja os
+[perfis completos](protocol.md#discoveryresponse).
+
+Conectar a TCP/5001 publicado no host não autoriza automaticamente uma consulta:
+o IP visto pelo hub precisa constar em `ACCESS_ALLOWED_HOSTS`. O endereço visto
+em uma conexão externa pode ser o da bridge/NAT do runtime. Consulte
+`source_ip` na auditoria e autorize explicitamente esse endereço para um cliente
+local adicional; manter somente `dashboard` é suficiente para a interface web.
+
+Outras opções do processo constam no
+[README dos hubs](../projeto-sockets/hubs/README.md): timeout de 10 segundos,
+frame de 1 MiB, datagrama de 16 KiB, registro de até 2.048 dispositivos e DNS
+renovado a cada 15 segundos. Para alterar uma opção não repassada pelo Compose,
+adicione-a ao `environment` do serviço; um valor em `.env` sozinho não injeta
+uma variável ausente dessa configuração. Falhas de DNS revogam autorizações
+antigas após três intervalos de renovação.
 
 ### Ingestão e SQLite
 
@@ -214,8 +263,9 @@ docker compose ps
 docker compose ps --format json
 ```
 
-O gateway testa 5001/TCP; o dashboard testa sua porta web; sensores controláveis
-testam os listeners TCP; o sensor C verifica o processo. Um container `healthy`
+O gateway testa 5001/TCP; os hubs testam 5010/5001 localmente; o dashboard testa
+sua porta web; sensores controláveis testam os listeners TCP; C e TypeScript
+verificam o processo. Um container `healthy`
 confirma disponibilidade local do processo, não a correção semântica de todas as
 métricas.
 
@@ -223,6 +273,7 @@ métricas.
 
 ```bash
 docker compose logs --since=10m gateway
+docker compose logs --since=10m hub_sensores hub_acesso
 docker compose logs -f sensor_estacionamento
 docker compose logs --tail=200 dashboard
 ```
@@ -233,8 +284,13 @@ Investigue especialmente:
 - descartes da fila de telemetria ou do limite de descoberta;
 - timeouts ao encaminhar comandos;
 - dispositivos marcados offline;
-- falhas de checkpoint ou retenção SQLite.
+- falhas de checkpoint ou retenção SQLite;
 - retries de escrita e prazo excedido ao drenar telemetria no encerramento.
+
+Os hubs produzem JSON com `hub_id`, `event`, `reason`, `source_ip`, `device_id`
+e `count`. Contadores incluem todos os pacotes; logs repetidos mostram as cinco
+primeiras ocorrências e cada centésima. O evento periódico `counters` fornece
+totais exatos, mesmo quando a auditoria de eventos foi amostrada.
 
 ### Banco de dados
 
@@ -242,7 +298,7 @@ A imagem do gateway contém Python, portanto é possível consultar SQLite sem o
 executável `sqlite3`:
 
 ```bash
-docker compose exec gateway python -c "import sqlite3; db=sqlite3.connect('/app/db/smartcity_gateway.db'); print(db.execute('SELECT device_id, type, status, last_seen FROM devices ORDER BY device_id').fetchall())"
+docker compose exec gateway python -c "import sqlite3; db=sqlite3.connect('/app/gateway/db/smartcity_gateway.db'); print(db.execute('SELECT device_id, type, status, last_seen FROM devices ORDER BY device_id').fetchall())"
 ```
 
 Para uma inspeção mais longa, prefira copiar o banco e usar uma ferramenta local.
@@ -253,23 +309,24 @@ snapshot consistente.
 
 ### Verificações rápidas
 
-Na raiz `projeto-sockets`, use um ambiente Python com os três manifestos e
+Na raiz `projeto-sockets`, use um ambiente Python com os manifestos e
 `protoc` disponível. Gere os bindings antes de executar a suíte:
 
 ```bash
 docker compose config --quiet
-python -m pip install -r gateway/requirements.txt -r client/requirements.txt -r sensor_python/requirements.txt
+python -m pip install -r gateway/requirements.txt -r client/requirements.txt -r sensor_python/requirements.txt -r hubs/requirements.txt -r sensor_intruder/requirements.txt
 protoc -I=common --python_out=gateway common/messages.proto
 protoc -I=common --python_out=client common/messages.proto
 protoc -I=common --python_out=sensor_python common/messages.proto
-python -m compileall -q gateway/main.py gateway/analytics.py client/app.py sensor_python/sensor.py
+python -m compileall -q gateway client sensor_python hubs sensor_intruder
 python -m unittest discover -s tests -v
 python -m unittest discover -s sensor_python -p 'test_*.py' -v
 ```
 
 Os testes Python cobrem OLAP e retenção, persistência e replay, falhas/cancelamento,
 drenagem, framing e correlação TCP, gráficos e classificação do dashboard, além
-de validação e atuação do sensor Python. Usam SQLite temporário e sockets locais;
+de validação e atuação do sensor Python. Incluem os dois hubs, o invasor e TCP/UDP
+em loopback: autorização, descarte, relay, correlação e encerramento. Usam SQLite temporário e sockets locais;
 não exigem os serviços Compose em execução.
 
 ### Cálculo AQI em C
@@ -279,9 +336,12 @@ Com GCC disponível, execute na raiz `projeto-sockets`:
 ```bash
 gcc -std=c11 -Wall -Wextra -Werror sensor_c/test_aqi.c -lm -o test-aqi
 ./test-aqi
+gcc -std=c11 -Wall -Wextra -Werror sensor_c/test_environment.c -lm -o test-environment
+./test-environment
 ```
 
-O teste cobre limites, lacunas entre faixas e monotonicidade do AQI. No Windows,
+Os testes cobrem limites, lacunas entre faixas e monotonicidade do AQI, além de
+13 métricas e relações entre chuva, umidade e UV em amostras simuladas. No Windows,
 o executável pode receber o nome `test-aqi.exe` e ser executado com
 `.\test-aqi.exe`.
 
@@ -305,22 +365,82 @@ protoc --proto_path=../common --go_out=./proto --go_opt=paths=source_relative ..
 go test ./...
 ```
 
+### Rust, TypeScript, Java e Lua
+
+Rust 1.90 ou superior gera o binding no `build.rs`, com `prost` e compilador
+Protobuf empacotado. Preserve o `Cargo.lock` e use a resolução travada:
+
+```bash
+cd sensor_rust
+cargo test --locked
+cargo build --release --locked
+```
+
+Na raiz `projeto-sockets`, Node 22.18 ou superior executa os testes de modelo e
+runtime sem instalar dependências npm. A verificação Python independente precisa
+de `protoc` ou `grpcio-tools`, além de Node no PATH ou em `NODE_BINARY`:
+
+```bash
+node --experimental-strip-types --test sensor_typescript/tests/model.test.ts sensor_typescript/tests/runtime.test.ts
+python -m unittest discover -s sensor_typescript/tests -p 'test_*.py' -v
+javac sensor_java/TrafficSample.java sensor_java/TrafficSampleTest.java
+java -cp sensor_java TrafficSampleTest
+```
+
+As suítes TypeScript contêm oito testes Node e duas verificações Python de
+compatibilidade no fio. O teste Java valida as amostras sem exigir o runtime
+Protobuf; o build completo compila também o sensor com o contrato compartilhado.
+
+Com Lua 5.4 disponível, execute a partir da pasta `sensor_lua`:
+
+```bash
+lua5.4 test_lamp_metrics.lua
+```
+
+Os Dockerfiles de C, Lua, Java, Go, Rust e TypeScript executam suas verificações
+durante o build. Registrar um teste no build ou no CI não demonstra que ele
+passou no host atual; informe separadamente ferramentas indisponíveis e builds
+que ainda precisam ser executados.
+
 ### Smoke test integrado
 
 ```bash
 docker compose up --build --wait
 docker compose ps
 curl --fail http://localhost:8501/_stcore/health
-docker compose logs --since=2m gateway sensor_estacionamento
+docker compose exec dashboard python smoke.py --expected-devices 66
+docker compose logs --since=2m gateway hub_sensores hub_acesso
 ```
 
-Confirme no dashboard que os dispositivos `parking_*` aparecem como tipo
-Estacionamento Inteligente, publicam cinco métricas e respondem a ON/OFF e à
-mudança de frequência.
+O smoke test roda dentro do serviço autorizado `dashboard` e verifica
+inventário, métricas e atuação pela rota dos hubs. Use 66 dispositivos com os
+padrões de frota; ajuste a expectativa se alterou as contagens. A tela deve
+mostrar as sete famílias, incluindo água Rust e lixeiras TypeScript.
 
-O CI instala as dependências Python, gera os três bindings, executa ambas as
-suítes Python e o teste C, depois constrói as imagens e realiza o smoke test.
+O CI instala dependências, gera bindings, executa as suítes de linguagem,
+constrói as imagens e o invasor, sobe o laboratório, roda o smoke test pelo
+dashboard e emite os cenários do perfil de segurança.
 Um teste unitário aprovado não confirma que o ambiente completo foi implantado.
+
+### Teste com sensor invasor
+
+O invasor não inicia na execução padrão. Depois de subir o laboratório:
+
+```bash
+docker compose --profile security-test run --build --rm sensor_invasor
+docker compose logs --since=2m hub_sensores hub_acesso
+```
+
+Uma rodada envia nove datagramas UDP e três pedidos TCP em 12 cenários. Os
+destinos são apenas os dois hubs configurados e precisam resolver para IPv4
+privado ou loopback. São no máximo dez rodadas, com intervalo mínimo de 0,02 s.
+`INTRUDER_ENABLED=1` fica restrito ao perfil; fora dele o emissor é desativado.
+
+UDP é relatado como `sent_not_acknowledged`; confirme o descarte nos eventos e
+contadores do hub. Os testes observam o destino backend e comprovam ausência
+de encaminhamento. Para TCP, a CLI distingue rejeição/fechamento de erro de
+transporte e sucesso inesperado. Veja o
+[README do invasor](../projeto-sockets/sensor_intruder/README.md).
 
 ## Diagnóstico
 
@@ -329,18 +449,21 @@ Um teste unitário aprovado não confirma que o ambiente completo foi implantado
 1. confirme que o daemon Docker está ativo;
 2. execute `docker compose ps`;
 3. confira se 8501 já está ocupada;
-4. leia os logs de `dashboard` e `gateway`.
+4. leia os logs de `dashboard`, `hub_acesso` e `gateway`.
 
 ### Sensores não aparecem
 
-1. verifique se o gateway está saudável;
+1. verifique gateway e `hub_sensores`;
 2. confira os logs do sensor por erros DNS/UDP;
-3. aguarde o próximo heartbeat ou probe multicast;
-4. verifique se o runtime/host permite multicast na rede bridge.
+3. consulte motivos como `source_identity_mismatch`, `profile_mismatch` ou
+   `device_not_discovered` na auditoria do hub;
+4. aguarde o próximo heartbeat. O probe do gateway na backend não recupera
+   automaticamente sensores na frontend.
 
 ### Comando rejeitado
 
-Verifique se o dispositivo é controlável e está registrado com porta válida. O
+Verifique se o dispositivo é controlável, possui registro vigente no hub e
+aparece com porta 5010 no gateway. Confirme a porta nativa no perfil do hub. O
 comando precisa conter IDs e timestamp, apontar para o mesmo alvo nos dois
 níveis, solicitar ON/OFF e/ou frequência entre 1 e 60. Relógio muito defasado e
 replay do `command_id` também podem causar rejeição.

@@ -26,6 +26,7 @@ COPY ./sensor_c .
 COPY ./common/messages.proto .
 RUN protoc-c --c_out=. messages.proto
 RUN gcc -std=c11 -Wall -Wextra -Werror test_aqi.c -lm -o test_aqi && ./test_aqi
+RUN gcc -std=c11 -Wall -Wextra -Werror test_environment.c -lm -o test_environment && ./test_environment
 RUN gcc -o sensor_c sensor.c messages.pb-c.c -lprotobuf-c -lm -pthread
 CMD ["./sensor_c"]
 
@@ -42,6 +43,8 @@ RUN luarocks --lua-version=5.4 install lua-protobuf && \
     luarocks --lua-version=5.4 install luaposix
 WORKDIR /app
 COPY ./sensor_lua/sensor.lua .
+COPY ./sensor_lua/lamp_metrics.lua ./sensor_lua/test_lamp_metrics.lua ./
+RUN lua5.4 test_lamp_metrics.lua
 COPY ./common/messages.proto .
 RUN protoc --descriptor_set_out=messages.pb messages.proto
 CMD ["sh", "-c", "eval $(luarocks --lua-version=5.4 path) && lua5.4 sensor.lua"]
@@ -52,8 +55,10 @@ WORKDIR /build
 RUN wget -q https://repo1.maven.org/maven2/com/google/protobuf/protobuf-java/3.25.1/protobuf-java-3.25.1.jar -O protobuf.jar
 COPY ./common ./common
 COPY ./sensor_java/sensor.java .
+COPY ./sensor_java/TrafficSample.java ./sensor_java/TrafficSampleTest.java ./
+RUN javac TrafficSample.java TrafficSampleTest.java && java TrafficSampleTest
 RUN protoc -I=./common --java_out=. ./common/messages.proto
-RUN javac -cp protobuf.jar sensor.java smartcity/Messages.java
+RUN javac -cp protobuf.jar sensor.java TrafficSample.java smartcity/Messages.java
 
 FROM eclipse-temurin:21-jre AS sensor_java
 WORKDIR /app
@@ -124,5 +129,63 @@ RUN protoc -I=./common --python_out=./client ./common/messages.proto
 WORKDIR /app/client
 EXPOSE 8501
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+
+FROM python:3.11-slim AS hubs_runtime
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY ./hubs/requirements.txt ./hubs/requirements.txt
+RUN python -m pip install --no-cache-dir -r hubs/requirements.txt && python -m pip check
+COPY ./hubs ./hubs
+COPY ./common ./common
+RUN protoc -I=common --python_out=. common/messages.proto \
+    && useradd --system --uid 10001 hub
+USER hub
+
+FROM hubs_runtime AS hub_sensores
+CMD ["python", "-m", "hubs.main", "sensores"]
+
+FROM hubs_runtime AS hub_acesso
+CMD ["python", "-m", "hubs.main", "acesso"]
+
+FROM python:3.11-slim AS sensor_invasor
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY ./sensor_intruder/requirements.txt ./sensor_intruder/requirements.txt
+RUN python -m pip install --no-cache-dir -r sensor_intruder/requirements.txt && python -m pip check
+COPY ./sensor_intruder ./sensor_intruder
+COPY ./common ./common
+RUN protoc -I=common --python_out=. common/messages.proto \
+    && useradd --system --uid 10002 intruder
+USER intruder
+CMD ["python", "-m", "sensor_intruder.main"]
+
+FROM rust:1.90-bookworm AS sensor_agua_builder
+WORKDIR /src/sensor_rust
+COPY ./sensor_rust/Cargo.toml ./sensor_rust/Cargo.lock ./sensor_rust/build.rs ./
+COPY ./sensor_rust/src ./src
+COPY ./sensor_rust/tests ./tests
+COPY ./common/messages.proto /src/common/messages.proto
+RUN cargo test --locked && cargo build --release --locked \
+    && mkdir -p /out && cp target/release/sensor-water /out/sensor-water
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS sensor_agua
+WORKDIR /app
+COPY --from=sensor_agua_builder --chown=65532:65532 /out/sensor-water /app/sensor-water
+USER 65532:65532
+EXPOSE 5008
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/app/sensor-water", "healthcheck"]
+ENTRYPOINT ["/app/sensor-water"]
+
+FROM node:22-bookworm-slim AS sensor_lixeiras
+WORKDIR /app/sensor_typescript
+COPY ./sensor_typescript ./
+RUN node --experimental-strip-types --test tests/*.test.ts
+USER node
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD node -e "try { process.kill(1, 0); } catch { process.exit(1); }"
+CMD ["node", "--experimental-strip-types", "src/main.ts"]
 
 FROM ${TARGET_SERVICE} AS final

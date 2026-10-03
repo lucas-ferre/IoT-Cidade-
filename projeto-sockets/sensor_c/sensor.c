@@ -14,9 +14,9 @@
 #include <netdb.h>
 #include <stdatomic.h>
 #include "messages.pb-c.h"
-#include "aqi.h"
+#include "environment.h"
 
-#define GATEWAY_HOST           "gateway"
+#define DEFAULT_GATEWAY_HOST  "gateway"
 #define GATEWAY_TELEMETRY_PORT "5000"
 #define GATEWAY_DISCOVERY_PORT "5002"
 #define MULTICAST_GROUP        "239.0.0.1"
@@ -29,14 +29,14 @@
 #define DISCOVERY_PROBE_JITTER_USEC 2000000
 #define HEARTBEAT_INTERVAL_SECS 10.0
 #define HEARTBEAT_JITTER_SECS   2.0
-#define NUM_METRICS            6
+#define NUM_METRICS            ENVIRONMENT_METRIC_COUNT
 #define THRESHOLD_SCAN_INTERVAL_SECS 1.0
 #define THRESHOLD_EVENT_COOLDOWN_SECS 3.0
 #define TEMPERATURE_THRESHOLD_C 32.0
 #define PM25_THRESHOLD_UGM3 35.0
 #define AQI_THRESHOLD 100.0
 
-#define DEVICE_COUNT_MAX 10
+#define DEVICE_COUNT_MAX 100
 
 // ====================================================================
 // VARIÁVEIS GLOBAIS E DE ESTADO DO CICLO DE VIDA
@@ -53,7 +53,8 @@ double           heartbeat_interval_secs = HEARTBEAT_INTERVAL_SECS;
 double           heartbeat_jitter_secs   = HEARTBEAT_JITTER_SECS;
 
 /* Frota de dispositivos — tamanho máximo estático, contagem real em device_count */
-int         device_count = 3;
+int         device_count = 12;
+const char *gateway_host = DEFAULT_GATEWAY_HOST;
 char        global_device_ids     [DEVICE_COUNT_MAX][64];
 const char *global_device_sectors [DEVICE_COUNT_MAX];
 Smartcity__DeviceStatus global_device_statuses[DEVICE_COUNT_MAX];
@@ -67,8 +68,15 @@ atomic_uint global_seq_counter;   /* inicializado em main() via atomic_init() */
 static const char *SENSOR_SECTORS[]      = { "Pici", "Benfica", "Porangabussu" };
 static const char *SENSOR_SECTOR_SLUGS[] = { "pici", "benfica", "porangabussu" };
 static const int   SENSOR_SECTOR_COUNT   = 3;
-static const char *METRIC_NAMES[] = { "temperature", "humidity", "co2",   "pm25",   "pm10",   "aqi"   };
-static const char *METRIC_UNITS[] = {          "C",       "%",   "ppm", "ug/m3", "ug/m3", "index" };
+static const char *METRIC_NAMES[] = {
+    "temperature", "humidity", "co2", "pm25", "pm10", "aqi",
+    "wind_speed", "wind_direction", "atmospheric_pressure", "rainfall",
+    "noise_level", "visibility", "uv_index"
+};
+static const char *METRIC_UNITS[] = {
+    "C", "%", "ppm", "ug/m3", "ug/m3", "index",
+    "m/s", "deg", "hPa", "mm/h", "dB", "km", "index"
+};
 
 char g_self_hostname[256];   /* inicializado em main() antes de pthread_create() */
 
@@ -137,7 +145,7 @@ static double read_env_double(const char *name, double fallback, double min_valu
     char *endptr = NULL;
     errno = 0;
     double value = strtod(raw, &endptr);
-    if (errno != 0 || endptr == raw || *endptr != '\0' || value < min_value) {
+    if (errno != 0 || endptr == raw || *endptr != '\0' || !isfinite(value) || value < min_value) {
         fprintf(stderr,
                 "[Sensor C:Config] %s='%s' inválido. Usando padrão %.1fs.\n",
                 name, raw, fallback);
@@ -165,19 +173,11 @@ static void init_metric_descriptors(Smartcity__Metric metrics[NUM_METRICS],
 }
 
 static void populate_environment_metrics(Smartcity__Metric metrics[NUM_METRICS]) {
-    double temperature = 25.0 + ((double)rand() / RAND_MAX) * 10.0;
-    double humidity    = 55.0 + ((double)rand() / RAND_MAX) * 35.0;
-    double co2         = 400.0 + ((double)rand() / RAND_MAX) * 200.0;
-    double pm25        = 5.0  + ((double)rand() / RAND_MAX) * 40.0;
-    double pm10        = pm25  + 5.0 + ((double)rand() / RAND_MAX) * 20.0;
-    double aqi         = compute_aqi(pm25);
-
-    metrics[0].value = temperature;
-    metrics[1].value = humidity;
-    metrics[2].value = co2;
-    metrics[3].value = pm25;
-    metrics[4].value = pm10;
-    metrics[5].value = aqi;
+    double values[NUM_METRICS];
+    sample_environment(values);
+    for (int i = 0; i < NUM_METRICS; i++) {
+        metrics[i].value = values[i];
+    }
 }
 
 static const char *environment_threshold_reason(Smartcity__Metric metrics[NUM_METRICS],
@@ -213,7 +213,7 @@ static int resolve_gateway_with_retry(const char *port,
                                       const char *channel) {
     int rc = EAI_FAIL;
     for (int attempt = 0; attempt < UDP_MAX_RETRIES; attempt++) {
-        rc = getaddrinfo(GATEWAY_HOST, port, hints, result);
+        rc = getaddrinfo(gateway_host, port, hints, result);
         if (rc == 0) return 0;
         fprintf(stderr, "[Sensor C:Retry] DNS %s falhou (tentativa %d/%d): %s\n",
                 channel, attempt + 1, UDP_MAX_RETRIES, gai_strerror(rc));
@@ -535,6 +535,10 @@ int main(void) {
     heartbeat_jitter_secs = read_env_double("SENSOR_HEARTBEAT_JITTER_SECS",
                                             HEARTBEAT_JITTER_SECS, 0.0);
 
+    const char *env_gateway_host = getenv("GATEWAY_HOST");
+    if (env_gateway_host != NULL && env_gateway_host[0] != '\0') {
+        gateway_host = env_gateway_host;
+    }
     const char *env_count = getenv("C_DEVICE_COUNT");
     if (env_count != NULL && env_count[0] != '\0') {
         int parsed = atoi(env_count);
@@ -565,7 +569,7 @@ int main(void) {
         printf("           [%d] Dispositivo=%-24s | Setor=%s\n",
                i + 1, global_device_ids[i], global_device_sectors[i]);
     }
-    printf("           Métricas: temperatura, umidade, CO\xE2\x82\x82, PM2.5, PM10, AQI\n");
+    printf("           %d métricas ambientais por dispositivo; destino UDP: %s\n", NUM_METRICS, gateway_host);
     printf("============================================================\n");
 
     struct sigaction sa;
